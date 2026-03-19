@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from postgrest.constants import CountMethod; print\\(CountMethod.__mro__\\); print\\(list\\(CountMethod\\)\\)\")",
+      "Bash(python -c \"import postgrest; print\\(postgrest.__version__\\)\")"
+    ]
+  }
+}

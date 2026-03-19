@@ -1,0 +1,63 @@
+{
+  "model_type": "GradientBoostingRegressor",
+  "n_estimators": 200,
+  "learning_rate": 0.05,
+  "max_depth": 5,
+  "features": [
+    "rating_diff",
+    "avg_rating_deviation",
+    "winrate_diff",
+    "activeness_diff",
+    "streak_diff",
+    "geo_score",
+    "h2h_matches",
+    "same_skill_category",
+    "wait_time_seconds",
+    "sport_encoded",
+    "format_encoded"
+  ],
+  "target": "match_quality_score",
+  "training_rows": 18000,
+  "test_rows": 4500,
+  "performance": {
+    "rmse": 0.0639,
+    "mae": 0.0517,
+    "r2": 0.8556,
+    "cv_r2_mean": 0.8206,
+    "cv_r2_std": 0.0432
+  },
+  "feature_importances": {
+    "rating_diff": 0.975,
+    "activeness_diff": 0.0051,
+    "sport_encoded": 0.0049,
+    "avg_rating_deviation": 0.0046,
+    "winrate_diff": 0.0041,
+    "wait_time_seconds": 0.0035,
+    "streak_diff": 0.0009,
+    "h2h_matches": 0.0006,
+    "geo_score": 0.0006,
+    "format_encoded": 0.0005,
+    "same_skill_category": 0.0002
+  },
+  "sport_classes": [
+    "badminton",
+    "lawn_tennis",
+    "pickleball",
+    "table_tennis"
+  ],
+  "format_classes": [
+    "doubles",
+    "mixed_doubles",
+    "singles"
+  ],
+  "sanity_check": {
+    "perfect_match": 0.964,
+    "good_match": 0.913,
+    "average_match": 0.784,
+    "poor_match": 0.483,
+    "order_correct": true
+  },
+  "trained_on": "synthetic_data_calibrated_from_real_atp_bwf_pklmart",
+  "total_real_matches_used_for_calibration": 88993,
+  "total_synthetic_matches_trained_on": 18000
+}

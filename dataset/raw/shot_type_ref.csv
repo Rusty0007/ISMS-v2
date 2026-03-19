@@ -1,0 +1,18 @@
+"shot_type","shot_type_desc","shot_type_desc_full"
+O,Other,
+U,Unknown,
+SE,Serve,The first shot of a rally; must bounce; must land beyond the NVZ; must land in the opposite box.
+R,Return,The second shot of a rally; must bounce. Returner typically proceeds to rush the net.
+tsDrp,"3rd Shot Drop","The third shot of a rally; player attempts to “drop” the ball into the NVZ, usually with reduced pace."
+tsDrv,"3rd Shot Drive",The third shot of the rally; player attempts to “drive” the ball with pace at or past their opponents.
+tsLob,"3rd Shot Lob",The third shot of a rally; player attempts to hit the ball over their opponents.
+tzApp,Transition Zone - Approach,"Hit by a player attempting to reach the NVZ. Often involves dropping the ball into the NVZ, but also includes an aggressive variation where the player hits a drive"
+tzRep,Transition Zone - Repel,"Hit by a player at the NVZ, and where one or more opponents is not near the NVZ. Attempts to “repel” their opponents away from the NVZ."
+D,Dink,Hit at the NVZ to opponents who are also at/near the NVZ. Typically kept low such that it cannot be easily attacked.
+SP,Speed Up,Hit at the NVZ to opponents who are also at/near the NVZ. Typically hit off an opponent’s dink with the intention of hitting it past their opponent and/or forcing a weak reply.
+HB,Hand Battle,"Hit with pace by a player who is responding to an opponent’s fast paced shot at NVZ. May be the response to a Speed Up, or another Hand Battle shot."
+Res,Reset,Hit with the intention of neutralizing an opponents’ Speed Up or Hand Battle shot by “absorbing” pace; attempts to get the ball to bounce in the NVZ.
+L,Lob,Hit high in the air with the intention of hitting over opponents. A poorly hit lob will often result with an opponent hitting a strong overhead.
+OH,Overhead,Hit in response to a lob where a player smacks the ball from head height or above.
+A,ATP,Hit around the post – usually with minimal clearance above the ground.
+E,Ernie,"Shot where contact is made immediately after the ball crosses the net. Player must avoid the NVZ by either jumping over it, or by walking along the sideline."

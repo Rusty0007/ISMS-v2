@@ -1,0 +1,50 @@
+# ── Secrets — NEVER commit these ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example          # allow the example/template file
+firebase-credentials.json
+*.pem
+*.key
+*.p12
+secrets/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node / Next.js ────────────────────────────────────────────────────────────
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+*.tsbuildinfo
+
+# ── Docker volumes / data ─────────────────────────────────────────────────────
+pgdata/
+*.sql.gz
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+Acer (C) - Shortcut.lnk
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+exploration_output.txt

@@ -1,0 +1,11 @@
+application:
+  port: 8000
+database:
+  path_to_data: "../data"
+  sources:
+    - codeforces
+  host: "localhost"
+  port: 5432
+  username: "postgres"
+  password: "password"
+  database_name: "codeforces"

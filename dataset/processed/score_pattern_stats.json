@@ -1,0 +1,36 @@
+{
+  "badminton_singles": {
+    "winner_score": {
+      "mean": 21.10254150139562,
+      "std": 1.0467566248967428,
+      "median": 21.0
+    },
+    "loser_score": {
+      "mean": 14.340237990304098,
+      "std": 4.034084413125131,
+      "median": 15.0
+    },
+    "score_diff": {
+      "mean": 6.762303511091523,
+      "std": 3.7393678094904566
+    },
+    "sample_count": 6807
+  },
+  "badminton_doubles": {
+    "winner_score": {
+      "mean": 21.218515684774292,
+      "std": 1.1757534888684908,
+      "median": 21.0
+    },
+    "loser_score": {
+      "mean": 15.505432287681714,
+      "std": 3.7764128656939273,
+      "median": 16.0
+    },
+    "score_diff": {
+      "mean": 5.7130833970925785,
+      "std": 3.3401187818092697
+    },
+    "sample_count": 6535
+  }
+}

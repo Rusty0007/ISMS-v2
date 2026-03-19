@@ -1,0 +1,19 @@
+{
+  "ending_type_distribution": {
+    "Error": 20395,
+    "Winner": 12814,
+    "Unforced Error": 4081,
+    "Other": 3029
+  },
+  "rally_length": {
+    "mean": 7.6239146119971135,
+    "median": 6.0,
+    "std": 5.4530492160132615,
+    "max": 70.0
+  },
+  "shot_type_distribution": {
+    "Drop": 20152,
+    "Drive": 16660,
+    "Lob": 608
+  }
+}

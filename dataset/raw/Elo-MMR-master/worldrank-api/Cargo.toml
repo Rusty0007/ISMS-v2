@@ -1,0 +1,49 @@
+[package]
+name = "worldrank-api"
+version = "0.1.0"
+authors = ["Aram Ebtekar <aramebtech@gmail.com>"]
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+path = "src/main.rs"
+name = "worldrank-api"
+
+[dependencies]
+multi-skill = { path = "../multi-skill" }
+
+serde = { version = "1.0", features = ["derive"]}
+sqlx = { version = "0.8.3", default-features = false, features = ["runtime-tokio-rustls", "macros", "postgres", "uuid", "chrono", "migrate"] }
+config = "0.15.8"
+actix-web = "4.9"
+#actix-http = "3.9"
+#actix-service = "2.0"
+#tracing-futures = "0.2.5"
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1.15", features = ["v4"] }
+chrono = "0.4.40"
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["registry", "env-filter"] }
+tracing-bunyan-formatter = "0.3.10"
+tracing-log = "0.2.0"
+tracing-actix-web = "0.7.16"
+tracing-appender = "0.2.3"
+serde-aux = "4.6"
+unicode-segmentation = "1.12"
+thiserror = "2.0"
+anyhow = "1.0"
+csv = "1.3"
+superslice = "1.0"
+secrecy = { version = "0.10.3", features = ["serde"] }
+
+[dev-dependencies]
+#actix-rt = "2.10"
+claims = "0.8.0"
+fake = "4.0"
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+serde_json = "1.0"
+wiremock = "0.6.2"
