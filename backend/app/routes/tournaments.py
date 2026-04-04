@@ -1,6 +1,7 @@
 import uuid
 import math
 import random
+from collections import Counter
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,8 +11,12 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.middleware.auth import get_current_user
-from app.models.models import Tournament, TournamentRegistration, Match, MatchSet, Profile, PlayerRating
+from app.models.models import (
+    Tournament, TournamentRegistration, Match, MatchSet, Profile, PlayerRating,
+    TournamentGroup, TournamentGroupMember, TournamentGroupStanding,
+)
 from app.services.notifications import send_notification
+from app.services.sport_rulesets import get_ruleset
 from app.services.smart_tiered import (
     generate_smart_tiered,
     entries_from_registrations,
@@ -74,6 +79,7 @@ def _tournament_summary(t: Tournament, reg_count: int = 0) -> dict:
         "min_rating":           t.min_rating,
         "max_rating":           t.max_rating,
         "requires_approval":    t.requires_approval,
+        "knockout_best_of":     getattr(t, "knockout_best_of", 3) or 3,
         "created_at":           str(t.created_at),
         "participant_count":    reg_count,
     }
@@ -133,6 +139,31 @@ def list_my_tournaments(
         ).count()
         result.append(_tournament_summary(t, count))
     return {"tournaments": result}
+
+
+# ── My invitations ───────────────────────────────────────────────────────────
+
+@router.get("/my-invitations")
+def my_tournament_invitations(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user_id = current_user["id"]
+    invitations = db.query(TournamentRegistration).filter(
+        TournamentRegistration.player_id == user_id,
+        TournamentRegistration.status == "invited",
+    ).order_by(TournamentRegistration.registered_at.desc()).all()
+
+    result = []
+    for reg in invitations:
+        t = db.query(Tournament).filter(Tournament.id == reg.tournament_id).first()
+        if t:
+            result.append({
+                "registration_id": str(reg.id),
+                "tournament": _tournament_summary(t),
+            })
+
+    return {"invitations": result, "count": len(result)}
 
 
 # ── Get detail ────────────────────────────────────────────────────────────────
@@ -197,24 +228,45 @@ def get_tournament(
         TournamentRegistration.status == "confirmed",
     ).first()
 
-    # Check if current user has a pending invitation
+    # Check if current user has a pending organizer invitation
     my_invite = db.query(TournamentRegistration).filter(
         TournamentRegistration.tournament_id == tournament_id,
         TournamentRegistration.player_id == user_id,
         TournamentRegistration.status == "invited",
     ).first()
 
+    # Check if current user is waiting for their partner to accept (they are the registrant)
+    my_pending_partner_reg = db.query(TournamentRegistration).filter(
+        TournamentRegistration.tournament_id == tournament_id,
+        TournamentRegistration.player_id == user_id,
+        TournamentRegistration.status == "pending_partner",
+    ).first()
+
+    # Check if current user has been invited as a partner (they are the partner_id target)
+    my_partner_invite = db.query(TournamentRegistration).filter(
+        TournamentRegistration.tournament_id == tournament_id,
+        TournamentRegistration.partner_id == user_id,
+        TournamentRegistration.status == "pending_partner",
+    ).first()
+    partner_invite_from: str | None = None
+    if my_partner_invite:
+        requester_profile = db.query(Profile).filter(Profile.id == my_partner_invite.player_id).first()
+        partner_invite_from = requester_profile.username if requester_profile else None
+
     organizer = db.query(Profile).filter(Profile.id == t.organizer_id).first()
 
     confirmed_count = sum(1 for r in all_regs if r.status == "confirmed")
     return {
-        "tournament":      _tournament_summary(t, confirmed_count),
-        "registrations":   reg_list,
-        "is_organizer":    is_org,
-        "is_registered":   my_reg is not None,
-        "my_reg_id":       str(my_reg.id) if my_reg else None,
-        "my_invite_id":    str(my_invite.id) if my_invite else None,
-        "organizer":       _profile_mini(organizer),
+        "tournament":              _tournament_summary(t, confirmed_count),
+        "registrations":           reg_list,
+        "is_organizer":            is_org,
+        "is_registered":           my_reg is not None,
+        "my_reg_id":               str(my_reg.id) if my_reg else None,
+        "my_invite_id":            str(my_invite.id) if my_invite else None,
+        "my_pending_partner_reg":  str(my_pending_partner_reg.id) if my_pending_partner_reg else None,
+        "my_partner_invite_reg":   str(my_partner_invite.id) if my_partner_invite else None,
+        "partner_invite_from":     partner_invite_from,
+        "organizer":               _profile_mini(organizer),
     }
 
 
@@ -282,6 +334,7 @@ def create_tournament(
         min_rating          = min_rating,
         max_rating          = max_rating,
         requires_approval   = bool(body.get("requires_approval", False)),
+        knockout_best_of    = int(body.get("knockout_best_of", 3)) if body.get("knockout_best_of") in (1, 3, "1", "3") else 3,
     )
     db.add(t)
     db.commit()
@@ -309,6 +362,8 @@ def update_tournament(
     for field in ("name", "description", "max_participants", "registration_open"):
         if field in body:
             setattr(t, field, body[field])
+    if "knockout_best_of" in body and body["knockout_best_of"] in (1, 3):
+        setattr(t, "knockout_best_of", int(body["knockout_best_of"]))
     for field in ("starts_at", "ends_at"):
         if field in body and body[field]:
             try:
@@ -377,6 +432,8 @@ def register_for_tournament(
     if existing:
         if existing.status == "pending_approval":
             raise HTTPException(400, "Your join request is already pending approval.")
+        if existing.status == "pending_partner":
+            raise HTTPException(400, "You already have a pending partner invite. Cancel it first to register with a different partner.")
         raise HTTPException(400, "Already registered.")
 
     # Check rating eligibility
@@ -391,47 +448,95 @@ def register_for_tournament(
         if t.max_rating is not None and player_rating > t.max_rating:
             raise HTTPException(400, f"Your rating ({int(player_rating)}) exceeds the maximum allowed ({int(t.max_rating)}).")
 
-    confirmed_count = db.query(TournamentRegistration).filter(
+    # Count confirmed + pending_partner (reserved slots) for capacity
+    active_count = db.query(TournamentRegistration).filter(
         TournamentRegistration.tournament_id == tournament_id,
-        TournamentRegistration.status == "confirmed",
+        TournamentRegistration.status.in_(["confirmed", "pending_partner", "pending_approval"]),
     ).count()
-    if t.max_participants is not None and confirmed_count >= t.max_participants:  # type: ignore[operator]
+    if t.max_participants is not None and active_count >= t.max_participants:  # type: ignore[operator]
         raise HTTPException(400, "Tournament is full.")
 
-    needs_approval = bool(t.requires_approval)
-    reg_status = "pending_approval" if needs_approval else "confirmed"
-
-    reg = TournamentRegistration(
-        tournament_id = tournament_id,
-        player_id     = user_id,
-        partner_id    = body.get("partner_id"),
-        status        = reg_status,
-        source        = "self_registered",
-    )
-    db.add(reg)
-    db.commit()
-
-    profile = db.query(Profile).filter(Profile.id == user_id).first()
-    pname = profile.username if profile else "A player"
-
-    if needs_approval:
-        send_notification(
-            user_id      = str(t.organizer_id),
-            title        = "New Join Request",
-            body         = f"@{pname} requested to join {t.name}. Review in your dashboard.",
-            notif_type   = "tournament_join_request",
-            reference_id = str(t.id),
-        )
-        return {"message": "Your request has been submitted and is awaiting organizer approval."}
+    # ── Doubles / singles format enforcement ──────────────────────────────────
+    is_dbl_fmt = _is_doubles(t.match_format)
+    partner_id = body.get("partner_id") if isinstance(body, dict) else None
+    if is_dbl_fmt:
+        if not partner_id:
+            raise HTTPException(
+                400,
+                "This is a doubles tournament. You must provide a partner_id to register.",
+            )
+        if str(partner_id) == str(user_id):
+            raise HTTPException(400, "You cannot register yourself as your own partner.")
+        # Ensure partner is not already registered in this tournament
+        partner_existing = db.query(TournamentRegistration).filter(
+            TournamentRegistration.tournament_id == tournament_id,
+            TournamentRegistration.player_id == partner_id,
+        ).first()
+        if partner_existing:
+            raise HTTPException(400, "Your selected partner is already registered in this tournament.")
     else:
-        send_notification(
-            user_id      = str(t.organizer_id),
-            title        = "New Tournament Registration",
-            body         = f"@{pname} registered for {t.name}.",
-            notif_type   = "tournament_registration",
-            reference_id = str(t.id),
+        if partner_id:
+            raise HTTPException(400, "This is a singles tournament. partner_id is not allowed.")
+
+    needs_approval = bool(t.requires_approval)
+
+    if is_dbl_fmt:
+        # Doubles: create registrant's row as "pending_partner" until partner accepts
+        reg = TournamentRegistration(
+            tournament_id = tournament_id,
+            player_id     = user_id,
+            partner_id    = partner_id,
+            status        = "pending_partner",
+            source        = "self_registered",
         )
-        return {"message": "Registered successfully."}
+        db.add(reg)
+        db.commit()
+
+        profile = db.query(Profile).filter(Profile.id == user_id).first()
+        pname = profile.username if profile else "A player"
+
+        # Notify the invited partner
+        send_notification(
+            user_id      = str(partner_id),
+            title        = "Doubles Partner Invite",
+            body         = f"@{pname} invited you to be their doubles partner in \"{t.name}\". Accept to register as a team.",
+            notif_type   = "doubles_partner_invite",
+            reference_id = str(reg.id),   # reg.id is used in accept/decline endpoints
+        )
+        return {"message": "Partner invite sent. Waiting for your partner to accept.", "registration_id": str(reg.id)}
+    else:
+        reg_status = "pending_approval" if needs_approval else "confirmed"
+        reg = TournamentRegistration(
+            tournament_id = tournament_id,
+            player_id     = user_id,
+            partner_id    = None,
+            status        = reg_status,
+            source        = "self_registered",
+        )
+        db.add(reg)
+        db.commit()
+
+        profile = db.query(Profile).filter(Profile.id == user_id).first()
+        pname = profile.username if profile else "A player"
+
+        if needs_approval:
+            send_notification(
+                user_id      = str(t.organizer_id),
+                title        = "New Join Request",
+                body         = f"@{pname} requested to join {t.name}. Review in your dashboard.",
+                notif_type   = "tournament_join_request",
+                reference_id = str(t.id),
+            )
+            return {"message": "Your request has been submitted and is awaiting organizer approval."}
+        else:
+            send_notification(
+                user_id      = str(t.organizer_id),
+                title        = "New Tournament Registration",
+                body         = f"@{pname} registered for {t.name}.",
+                notif_type   = "tournament_registration",
+                reference_id = str(t.id),
+            )
+            return {"message": "Registered successfully."}
 
 
 # ── Withdraw ──────────────────────────────────────────────────────────────────
@@ -452,9 +557,159 @@ def withdraw_from_tournament(
     t = db.query(Tournament).filter(Tournament.id == tournament_id).first()
     if t and str(t.status) != "upcoming":
         raise HTTPException(400, "Cannot withdraw from a started tournament.")
+
+    # If cancelling a pending_partner invite, notify the invited partner
+    if str(reg.status) == "pending_partner" and reg.partner_id:
+        profile = db.query(Profile).filter(Profile.id == user_id).first()
+        pname = profile.username if profile else "A player"
+        send_notification(
+            user_id      = str(reg.partner_id),
+            title        = "Partner Invite Cancelled",
+            body         = f"@{pname} cancelled their doubles partner invite for \"{t.name if t else 'a tournament'}\".",
+            notif_type   = "doubles_partner_declined",
+            reference_id = str(t.id) if t else None,
+        )
+
     db.delete(reg)
     db.commit()
     return {"message": "Withdrawn successfully."}
+
+
+# ── Doubles partner invite: accept / decline ──────────────────────────────────
+
+@router.post("/partner-invite/{registration_id}/accept")
+def accept_partner_invite(
+    registration_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The invited partner accepts: both registrations become confirmed."""
+    user_id = current_user["id"]
+
+    requester_reg = db.query(TournamentRegistration).filter(
+        TournamentRegistration.id == registration_id,
+    ).first()
+    if not requester_reg:
+        raise HTTPException(404, "Partner invite not found.")
+    if str(requester_reg.partner_id) != str(user_id):
+        raise HTTPException(403, "This invite was not sent to you.")
+    if str(requester_reg.status) != "pending_partner":
+        raise HTTPException(400, "This invite has already been responded to.")
+
+    t = db.query(Tournament).filter(Tournament.id == requester_reg.tournament_id).first()
+    if not t:
+        raise HTTPException(404, "Tournament not found.")
+    if t.registration_open is not True:
+        raise HTTPException(400, "Registration is closed.")
+
+    # Check partner is not already separately registered
+    existing = db.query(TournamentRegistration).filter(
+        TournamentRegistration.tournament_id == requester_reg.tournament_id,
+        TournamentRegistration.player_id == user_id,
+    ).first()
+    if existing:
+        raise HTTPException(400, "You are already registered in this tournament.")
+
+    # Capacity check — both players must fit (they share one team slot in doubles,
+    # but each gets their own registration row)
+    if t.max_participants is not None:
+        confirmed_count = db.query(TournamentRegistration).filter(
+            TournamentRegistration.tournament_id == requester_reg.tournament_id,
+            TournamentRegistration.status.in_(["confirmed", "pending_approval"]),
+        ).count()
+        # The requester already holds a pending_partner slot; accepting adds partner (+1)
+        # so we only need room for 1 more player
+        if confirmed_count + 1 > t.max_participants:
+            raise HTTPException(400, "Tournament is full. Cannot confirm this doubles team.")
+
+    needs_approval = bool(t.requires_approval)
+    final_status   = "pending_approval" if needs_approval else "confirmed"
+
+    # Confirm (or pend approval for) requester
+    setattr(requester_reg, "status", final_status)
+
+    # Create partner's own registration row
+    partner_reg = TournamentRegistration(
+        tournament_id = requester_reg.tournament_id,
+        player_id     = user_id,
+        partner_id    = requester_reg.player_id,
+        status        = final_status,
+        source        = "self_registered",
+    )
+    db.add(partner_reg)
+    db.commit()
+
+    requester_profile = db.query(Profile).filter(Profile.id == requester_reg.player_id).first()
+    partner_profile   = db.query(Profile).filter(Profile.id == user_id).first()
+    rname = requester_profile.username if requester_profile else "Your partner"
+    pname = partner_profile.username   if partner_profile   else "A player"
+
+    # Notify requester that partner accepted
+    send_notification(
+        user_id      = str(requester_reg.player_id),
+        title        = "Partner Accepted",
+        body         = f"@{pname} accepted your doubles partner invite for \"{t.name}\".",
+        notif_type   = "doubles_partner_accepted",
+        reference_id = str(t.id),
+    )
+    if needs_approval:
+        send_notification(
+            user_id      = str(t.organizer_id),
+            title        = "New Doubles Team Join Request",
+            body         = f"Team @{rname} / @{pname} requested to join {t.name}.",
+            notif_type   = "tournament_join_request",
+            reference_id = str(t.id),
+        )
+        return {"message": "Partner accepted. Your team is awaiting organizer approval."}
+    send_notification(
+        user_id      = str(t.organizer_id),
+        title        = "New Team Registration",
+        body         = f"Team @{rname} / @{pname} registered for {t.name}.",
+        notif_type   = "tournament_registration",
+        reference_id = str(t.id),
+    )
+    return {"message": "You have joined the tournament as a doubles team."}
+
+
+@router.post("/partner-invite/{registration_id}/decline")
+def decline_partner_invite(
+    registration_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The invited partner declines: requester's registration is removed."""
+    user_id = current_user["id"]
+
+    requester_reg = db.query(TournamentRegistration).filter(
+        TournamentRegistration.id == registration_id,
+    ).first()
+    if not requester_reg:
+        raise HTTPException(404, "Partner invite not found.")
+    if str(requester_reg.partner_id) != str(user_id):
+        raise HTTPException(403, "This invite was not sent to you.")
+    if str(requester_reg.status) != "pending_partner":
+        raise HTTPException(400, "This invite has already been responded to.")
+
+    t = db.query(Tournament).filter(Tournament.id == requester_reg.tournament_id).first()
+
+    requester_profile = db.query(Profile).filter(Profile.id == requester_reg.player_id).first()
+    rname = requester_profile.username if requester_profile else "Your partner"
+    partner_profile = db.query(Profile).filter(Profile.id == user_id).first()
+    pname = partner_profile.username if partner_profile else "A player"
+
+    db.delete(requester_reg)
+    db.commit()
+
+    # Notify requester that partner declined
+    if t:
+        send_notification(
+            user_id      = str(requester_reg.player_id),
+            title        = "Partner Declined",
+            body         = f"@{pname} declined your doubles partner invite for \"{t.name}\". You can register again with a different partner.",
+            notif_type   = "doubles_partner_declined",
+            reference_id = str(t.id),
+        )
+    return {"message": "You declined the doubles partner invite."}
 
 
 # ── Organizer invite player ───────────────────────────────────────────────────
@@ -808,11 +1063,91 @@ def smart_tiered_preview(
     }
 
 
+# ── Pool-play configuration options ───────────────────────────────────────────
+
+def _pool_sizes(n: int, num_pools: int) -> list[int]:
+    """Distribute n players into num_pools pools as evenly as possible."""
+    base, extra = divmod(n, num_pools)
+    return [base + (1 if i < extra else 0) for i in range(num_pools)]
+
+def _recommend_qualifiers(n: int, num_pools: int) -> int:
+    """Return the cleanest power-of-2 qualifier count >= 4."""
+    # Aim for each pool to contribute at least 1 qualifier; default 4/8/16
+    for q in [4, 8, 16]:
+        if q <= n and q >= num_pools:
+            return q
+    return 4
+
+def _knockout_stage_label(qualifiers: int) -> str:
+    return {2: "Final", 4: "Semifinals", 8: "Quarterfinals", 16: "Round of 16"}.get(qualifiers, f"Top {qualifiers}")
+
+def _pool_play_options(n: int) -> list[dict]:
+    """Return all valid pool configurations for n players."""
+    options = []
+    # Valid pool counts: any divisor-ish value where pools have 3–6 players each
+    for num_pools in range(2, n // 2 + 1):
+        sizes = _pool_sizes(n, num_pools)
+        min_sz, max_sz = min(sizes), max(sizes)
+        if min_sz < 3 or max_sz > 6:
+            continue
+        qualifiers = _recommend_qualifiers(n, num_pools)
+        # Summarise pool sizes e.g. "4, 4, 4" or "5, 5, 4"
+        cnt = Counter(sizes)
+        size_summary = " · ".join(f"{cnt[s]}×{s}" if cnt[s] > 1 else str(s) for s in sorted(cnt.keys(), reverse=True))
+        pool_matches = sum(s * (s - 1) // 2 for s in sizes)
+        options.append({
+            "num_pools":       num_pools,
+            "pool_sizes":      sizes,
+            "size_summary":    size_summary,
+            "pool_matches":    pool_matches,
+            "qualifiers":      qualifiers,
+            "knockout_stage":  _knockout_stage_label(qualifiers),
+            "is_recommended":  False,  # set below
+        })
+
+    # Mark the recommended option
+    # Prefer the option that matches the master rule table
+    rule_defaults: dict[int, int] = {12: 3, 16: 4, 18: 4, 20: 4, 24: 6}
+    preferred_pools = rule_defaults.get(n)
+    if preferred_pools:
+        for opt in options:
+            if opt["num_pools"] == preferred_pools:
+                opt["is_recommended"] = True
+                break
+    elif options:
+        # Default: pick the option with pool size closest to 4
+        best = min(options, key=lambda o: abs(sum(o["pool_sizes"]) / len(o["pool_sizes"]) - 4))
+        best["is_recommended"] = True
+
+    return options
+
+
+@router.get("/{tournament_id}/pool-play-options")
+def get_pool_play_options(
+    tournament_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    t = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+    if not t:
+        raise HTTPException(404, "Tournament not found.")
+    if not _is_organizer(t, current_user["id"]):
+        raise HTTPException(403, "Not authorized.")
+    regs = db.query(TournamentRegistration).filter(
+        TournamentRegistration.tournament_id == tournament_id,
+        TournamentRegistration.status == "confirmed",
+    ).all()
+    n = len(regs)
+    options = _pool_play_options(n)
+    return {"participant_count": n, "options": options}
+
+
 # ── Generate bracket ──────────────────────────────────────────────────────────
 
 @router.post("/{tournament_id}/generate-bracket")
 def generate_bracket(
     tournament_id: str,
+    body: dict = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -830,12 +1165,50 @@ def generate_bracket(
     if existing:
         raise HTTPException(400, "Bracket already exists.")
 
+    # Warn if any doubles teams are still waiting for partner to accept
+    if _is_doubles(t.match_format):
+        pending_teams = db.query(TournamentRegistration).filter(
+            TournamentRegistration.tournament_id == tournament_id,
+            TournamentRegistration.status == "pending_partner",
+        ).count()
+        if pending_teams > 0:
+            raise HTTPException(
+                400,
+                f"{pending_teams} team(s) still have a pending partner invite. "
+                "Ask them to accept or cancel before generating the bracket.",
+            )
+
     regs = db.query(TournamentRegistration).filter(
         TournamentRegistration.tournament_id == tournament_id,
         TournamentRegistration.status == "confirmed",
     ).all()
     if len(regs) < 2:
         raise HTTPException(400, "Need at least 2 confirmed participants.")
+
+    # ── Format enforcement before bracket generation ───────────────────────
+    if _is_doubles(t.match_format):
+        missing = [str(r.player_id) for r in regs if not r.partner_id]
+        if missing:
+            profiles_map = {
+                str(p.id): p
+                for p in db.query(Profile).filter(Profile.id.in_(missing)).all()
+            }
+            names = ", ".join(
+                profiles_map[pid].username if pid in profiles_map else pid[:8]
+                for pid in missing
+            )
+            raise HTTPException(
+                400,
+                f"This is a doubles tournament but the following registrations are missing a partner: {names}. "
+                "Each team must have exactly 2 players before the bracket can be generated.",
+            )
+    else:
+        # Singles — ensure no one slipped in with a partner
+        has_partner = [r for r in regs if r.partner_id]
+        if has_partner:
+            for r in has_partner:
+                r.partner_id = None
+            db.flush()
 
     # ── Smart Tiered Draw ──────────────────────────────────────────────────
     if t.draw_method == "smart_tiered":
@@ -879,6 +1252,9 @@ def generate_bracket(
         return _generate_group_stage_knockout(t, regs, db)
     if str(t.format) in ("swiss", "TournamentFormat.swiss"):
         return _generate_swiss(t, regs, db)
+    if str(t.format) in ("pool_play", "TournamentFormat.pool_play"):
+        num_pools = int((body or {}).get("num_pools", 0)) or None
+        return _generate_pool_play(t, regs, db, num_pools=num_pools)
     return _generate_single_elimination(t, regs, db)
 
 
@@ -1156,6 +1532,146 @@ def _generate_double_elimination(t: Tournament, regs: list, db: Session):
     return {"message": f"Double elimination bracket generated: {size}-player ({wb_rounds} WB rounds, {lb_round_num} LB rounds)."}
 
 
+def _generate_pool_play(t: Tournament, regs: list, db: Session, num_pools: int | None = None):
+    """
+    Pool-play (group-stage only, no knockout).
+    If num_pools is given, distribute n players into that many pools (possibly unequal sizes 3–6).
+    Otherwise, auto-select a balanced option.
+    """
+    n = len(regs)
+
+    # ── Resolve num_groups and per-pool sizes ────────────────────────────────
+    if num_pools and num_pools >= 2:
+        sizes = _pool_sizes(n, num_pools)
+        if min(sizes) < 3 or max(sizes) > 6:
+            raise HTTPException(
+                400,
+                f"With {num_pools} pools and {n} players, pool sizes would be "
+                f"{min(sizes)}–{max(sizes)}. Each pool must have 3–6 players.",
+            )
+        num_groups = num_pools
+    else:
+        # Auto: try equal groups, priority 4 > 5 > 3
+        num_groups = None
+        for gs in [4, 5, 3]:
+            if n % gs == 0 and (n // gs) >= 2:
+                num_groups = n // gs
+                break
+        if num_groups is None:
+            options = _pool_play_options(n)
+            if options:
+                # Pick recommended or first valid option
+                rec = next((o for o in options if o["is_recommended"]), options[0])
+                num_groups = rec["num_pools"]
+            else:
+                valid_examples = "6 (2×3), 8 (2×4), 9 (3×3), 10 (2×5), 12 (3×4), 15 (3×5), 16 (4×4), 20 (4×5)"
+                raise HTTPException(
+                    400,
+                    f"Pool play cannot be generated: {n} confirmed entries cannot form balanced pools "
+                    f"of 3–6 players. Valid counts include: {valid_examples}.",
+                )
+        sizes = _pool_sizes(n, num_groups)
+
+    # ── Order entries: seeded first (by seed), then randomised unseeded ──────
+    seeded   = sorted([r for r in regs if r.seed], key=lambda r: r.seed)
+    unseeded = [r for r in regs if not r.seed]
+    random.shuffle(unseeded)
+    ordered  = seeded + unseeded
+
+    # ── Serpentine distribution for balanced group strength ──────────────────
+    # Assign each player to a pool index using snake-draft order
+    group_entries: list[list] = [[] for _ in range(num_groups)]
+    pool_cursors = [0] * num_groups  # how many slots filled per pool
+    direction = 1
+    current_pool = 0
+    for reg in ordered:
+        # Find next pool that still has capacity
+        while pool_cursors[current_pool] >= sizes[current_pool]:
+            current_pool = (current_pool + direction) % num_groups
+        group_entries[current_pool].append(reg)
+        pool_cursors[current_pool] += 1
+        # Advance in snake direction
+        next_pool = current_pool + direction
+        if next_pool < 0 or next_pool >= num_groups:
+            direction *= -1
+            next_pool = current_pool + direction
+        current_pool = next_pool % num_groups
+
+    # ── Create TournamentGroup records ───────────────────────────────────────
+    groups_db: list[TournamentGroup] = []
+    for i in range(num_groups):
+        g = TournamentGroup(
+            id=uuid.uuid4(),
+            tournament_id=t.id,
+            group_name=f"Group {chr(ord('A') + i)}",
+            group_order=i,
+            group_size=sizes[i],
+        )
+        db.add(g)
+        groups_db.append(g)
+    db.flush()
+
+    # ── Create members, standings, and round-robin matches per group ─────────
+    is_dbl = _is_doubles(t.match_format)
+    pos    = 1
+    for g_idx, (g_db, members) in enumerate(zip(groups_db, group_entries)):
+        side = f"G{chr(ord('A') + g_idx)}"   # GA, GB, GC… (distinct from G0/G1 used by group_stage_knockout)
+
+        for reg in members:
+            db.add(TournamentGroupMember(
+                id=uuid.uuid4(),
+                tournament_group_id=g_db.id,
+                entry_id=reg.id,
+                seed_number=reg.seed,
+            ))
+            db.add(TournamentGroupStanding(
+                id=uuid.uuid4(),
+                tournament_id=t.id,
+                group_id=g_db.id,
+                entry_id=reg.id,
+            ))
+
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                m = Match(
+                    id=uuid.uuid4(),
+                    sport=t.sport,
+                    match_type="tournament",
+                    match_format=t.match_format,
+                    status="pending",
+                    tournament_id=t.id,
+                    player1_id=members[i].player_id,
+                    player2_id=members[j].player_id,
+                    round_number=1,
+                    bracket_position=pos,
+                    bracket_side=side,
+                )
+                if is_dbl:
+                    setattr(m, "team1_player1", members[i].player_id)
+                    setattr(m, "team1_player2", members[i].partner_id)
+                    setattr(m, "team2_player1", members[j].player_id)
+                    setattr(m, "team2_player2", members[j].partner_id)
+                db.add(m)
+                pos += 1
+
+    setattr(t, "status", "registration_closed")
+    db.commit()
+
+    total_matches = pos - 1
+    qualifiers    = _recommend_qualifiers(n, num_groups)
+    cnt           = Counter(sizes)
+    size_summary  = " · ".join(f"{cnt[s]}×{s}" if cnt[s] > 1 else str(s) for s in sorted(cnt.keys(), reverse=True))
+    return {
+        "message": f"Pool play generated: {num_groups} pools ({size_summary}), {total_matches} total matches.",
+        "groups": num_groups,
+        "pool_sizes": sizes,
+        "size_summary": size_summary,
+        "total_matches": total_matches,
+        "recommended_qualifiers": qualifiers,
+        "knockout_stage": _knockout_stage_label(qualifiers),
+    }
+
+
 def _generate_group_stage_knockout(
     t: Tournament,
     regs: list,
@@ -1256,6 +1772,223 @@ def _generate_group_stage_knockout(
     return result
 
 
+# ── Promote group stage winners to knockout ───────────────────────────────────
+
+@router.post("/{tournament_id}/promote-to-knockout")
+def promote_to_knockout(
+    tournament_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    For group_stage_knockout tournaments:
+    - Validates all group-stage matches are complete
+    - Advances top 2 per group to a new randomly-seeded single-elimination knockout bracket
+    - QF/SF = BO3, Championship = BO5 (per-match best_of override)
+    - Deletes existing empty knockout placeholders before creating real matches
+    """
+    t = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+    if not t:
+        raise HTTPException(404, "Tournament not found.")
+    if not _is_organizer(t, current_user["id"]):
+        raise HTTPException(403, "Not authorized.")
+
+    fmt = str(t.format)
+    if "group_stage_knockout" not in fmt:
+        raise HTTPException(400, "Promote-to-knockout is only available for Group Stage + Knockout tournaments.")
+
+    if str(t.status) not in ("ongoing", "registration_closed"):
+        raise HTTPException(400, "Tournament must be ongoing or registration closed to promote to knockout.")
+
+    # ── Fetch all group-stage matches (bracket_side starts with G, not K) ────
+    all_matches = db.query(Match).filter(Match.tournament_id == tournament_id).all()
+    group_matches = [m for m in all_matches if (getattr(m, "bracket_side", "") or "").startswith("G")]
+    ko_matches    = [m for m in all_matches if (getattr(m, "bracket_side", "") or "") == "K"]
+
+    if not group_matches:
+        raise HTTPException(400, "No group-stage matches found. Generate the bracket first.")
+
+    # ── Ensure all group matches are completed ───────────────────────────────
+    incomplete = [
+        m for m in group_matches
+        if str(m.status.value if hasattr(m.status, "value") else m.status) != "completed"
+    ]
+    if incomplete:
+        raise HTTPException(
+            400,
+            f"{len(incomplete)} group-stage match(es) are not yet completed. "
+            "All group matches must finish before promotion."
+        )
+
+    # ── Already promoted? (knockout matches have real players) ───────────────
+    ko_with_players = [m for m in ko_matches if m.player1_id is not None or m.player2_id is not None]
+    if ko_with_players:
+        raise HTTPException(400, "Knockout stage has already been populated.")
+
+    # ── Gather top 2 from each group (by bracket_side G0, G1, …) ────────────
+    # Group matches are keyed by their bracket_side (G0, G1, …)
+    sides: set[str] = {getattr(m, "bracket_side", "") for m in group_matches}
+
+    # Build standings per group from match results
+    qualified_player_ids: list[str] = []
+
+    for side in sorted(sides):
+        side_matches = [m for m in group_matches if getattr(m, "bracket_side", "") == side]
+
+        # Collect all player ids in this group
+        player_ids_in_group: set[str] = set()
+        for m in side_matches:
+            if m.player1_id:
+                player_ids_in_group.add(str(m.player1_id))
+            if m.player2_id:
+                player_ids_in_group.add(str(m.player2_id))
+
+        # Tally wins and point_diff per player
+        wins_map:  dict[str, int] = {pid: 0 for pid in player_ids_in_group}
+        pdiff_map: dict[str, int] = {pid: 0 for pid in player_ids_in_group}
+
+        for m in side_matches:
+            if not m.winner_id:
+                continue
+            winner_str = str(m.winner_id)
+            loser_str  = str(m.player1_id) if winner_str == str(m.player2_id) else str(m.player2_id)
+            wins_map[winner_str] = wins_map.get(winner_str, 0) + 1
+
+            sets = db.query(MatchSet).filter(MatchSet.match_id == m.id).all()
+            p1_pts = sum((s.player1_score or 0) + (s.team1_score or 0) for s in sets)
+            p2_pts = sum((s.player2_score or 0) + (s.team2_score or 0) for s in sets)
+            if winner_str == str(m.player1_id):
+                pdiff_map[winner_str] = pdiff_map.get(winner_str, 0) + (p1_pts - p2_pts)
+                pdiff_map[loser_str]  = pdiff_map.get(loser_str,  0) + (p2_pts - p1_pts)
+            else:
+                pdiff_map[winner_str] = pdiff_map.get(winner_str, 0) + (p2_pts - p1_pts)
+                pdiff_map[loser_str]  = pdiff_map.get(loser_str,  0) + (p1_pts - p2_pts)
+
+        # Sort: wins desc → point_diff desc → random tiebreak
+        ranked = sorted(
+            player_ids_in_group,
+            key=lambda pid: (-wins_map.get(pid, 0), -pdiff_map.get(pid, 0), random.random()),
+        )
+        # Take top 2 (or top 1 if group has only 2 players)
+        advance = ranked[:2] if len(ranked) >= 2 else ranked[:1]
+        qualified_player_ids.extend(advance)
+
+    if len(qualified_player_ids) < 2:
+        raise HTTPException(400, "Not enough players qualified for knockout stage.")
+
+    # ── Delete existing empty K placeholder matches ───────────────────────────
+    # First null out cross-references to avoid FK violations (next_match_id
+    # references the same matches table and has no ON DELETE SET NULL)
+    for m in ko_matches:
+        setattr(m, "next_match_id", None)
+        setattr(m, "loser_next_match_id", None)
+    db.flush()
+    for m in ko_matches:
+        db.query(MatchSet).filter(MatchSet.match_id == m.id).delete()
+        db.delete(m)
+    db.flush()
+
+    # ── Randomly reshuffle qualified players ─────────────────────────────────
+    random.shuffle(qualified_player_ids)
+
+    # ── Build single-elimination knockout bracket ─────────────────────────────
+    n        = len(qualified_player_ids)
+    ko_size  = 1
+    while ko_size < n:
+        ko_size *= 2
+    ko_rounds = int(math.log2(ko_size))
+
+    is_dbl = _is_doubles(t.match_format)
+
+    # Determine best_of per round: championship (round ko_rounds) = BO5, others = BO3
+    # Rounds go 1 = first round (QF or earlier), ko_rounds = Final
+    new_ko: dict[tuple[int, int], Match] = {}
+
+    for r in range(1, ko_rounds + 1):
+        count  = max(1, ko_size // (2 ** r))
+        bo     = 5 if r == ko_rounds else 3
+        for kpos in range(1, count + 1):
+            m = Match(
+                id               = uuid.uuid4(),
+                sport            = t.sport,
+                match_type       = "tournament",
+                match_format     = t.match_format,
+                status           = "pending",
+                tournament_id    = t.id,
+                round_number     = r,
+                bracket_position = kpos,
+                bracket_side     = "K",
+                best_of          = bo,
+            )
+            db.add(m)
+            new_ko[(r, kpos)] = m
+
+    db.flush()
+
+    # Wire next_match_id links
+    for (r, kpos), m in new_ko.items():
+        if r < ko_rounds:
+            next_m = new_ko.get((r + 1, (kpos + 1) // 2))
+            if next_m:
+                setattr(m, "next_match_id", next_m.id)
+
+    db.flush()
+
+    # ── Seed qualified players into round-1 slots (byes for non-power-of-2) ──
+    r1_matches = sorted(
+        [(kpos, m) for (r, kpos), m in new_ko.items() if r == 1],
+        key=lambda x: x[0],
+    )
+
+    slot_idx = 0
+    for kpos, m in r1_matches:
+        # slot 1 (odd position) gets player1, slot 2 (even) gets player2
+        p1 = qualified_player_ids[slot_idx] if slot_idx < len(qualified_player_ids) else None
+        p2 = qualified_player_ids[slot_idx + 1] if slot_idx + 1 < len(qualified_player_ids) else None
+        slot_idx += 2
+
+        if p1:
+            setattr(m, "player1_id", p1)
+        if p2:
+            setattr(m, "player2_id", p2)
+
+        # If only one player (bye): auto-complete and advance
+        if p1 and not p2:
+            setattr(m, "status", "completed")
+            setattr(m, "winner_id", p1)
+            setattr(m, "completed_at", datetime.now(timezone.utc))
+            if m.next_match_id is not None:
+                next_m = new_ko.get((2, (kpos + 1) // 2))
+                if next_m:
+                    if kpos % 2 == 1:
+                        setattr(next_m, "player1_id", p1)
+                    else:
+                        setattr(next_m, "player2_id", p1)
+
+    db.commit()
+
+    # ── Notify all participants ───────────────────────────────────────────────
+    regs = db.query(TournamentRegistration).filter(
+        TournamentRegistration.tournament_id == tournament_id,
+        TournamentRegistration.status == "confirmed",
+    ).all()
+    for reg in regs:
+        send_notification(
+            user_id      = str(reg.player_id),
+            title        = "Knockout Stage Begins!",
+            body         = f"Group stage is over — {t.name} knockout bracket is live!",
+            notif_type   = "tournament_ko_promotion",
+            reference_id = str(t.id),
+        )
+
+    return {
+        "message": f"Knockout bracket generated: {len(qualified_player_ids)} players, {ko_size}-slot bracket.",
+        "qualified_count": len(qualified_player_ids),
+        "ko_size": ko_size,
+        "ko_rounds": ko_rounds,
+    }
+
+
 def _place_winner_in_next(
     from_pos: int,
     winner_id: str,
@@ -1291,12 +2024,13 @@ def get_bracket(
         Match.tournament_id == tournament_id
     ).order_by(Match.bracket_side, Match.round_number, Match.bracket_position).all()
 
-    # Batch-load profiles for all players (including team members for doubles)
+    # Batch-load profiles for all players + referees
     player_ids: set[str] = set()
     for m in matches:
         for fk in (m.player1_id, m.player2_id,
                    getattr(m, "team1_player1", None), getattr(m, "team1_player2", None),
-                   getattr(m, "team2_player1", None), getattr(m, "team2_player2", None)):
+                   getattr(m, "team2_player1", None), getattr(m, "team2_player2", None),
+                   m.referee_id):
             if fk is not None:
                 player_ids.add(str(fk))
     profiles_map: dict[str, Profile] = {}
@@ -1304,11 +2038,20 @@ def get_bracket(
         for p in db.query(Profile).filter(Profile.id.in_(player_ids)).all():
             profiles_map[str(p.id)] = p
 
+    # Batch-load courts
+    court_ids = {str(m.court_id) for m in matches if m.court_id}
+    courts_map: dict[str, str] = {}
+    if court_ids:
+        from app.models.models import Court as CourtModel
+        for c in db.query(CourtModel).filter(CourtModel.id.in_(court_ids)).all():
+            courts_map[str(c.id)] = c.name
+
     is_dbl = _is_doubles(t.match_format)
 
     def _match_dict(m: Match) -> dict:
         p1 = profiles_map.get(str(m.player1_id)) if m.player1_id else None
         p2 = profiles_map.get(str(m.player2_id)) if m.player2_id else None
+        ref = profiles_map.get(str(m.referee_id)) if m.referee_id else None
         sets = []
         for s in (m.sets or []):
             sets.append({
@@ -1318,10 +2061,13 @@ def get_bracket(
                 "is_completed":  s.is_completed,
             })
 
+        court_name = courts_map.get(str(m.court_id)) if m.court_id else None
+
         d: dict = {
             "match_id":            str(m.id),
             "bracket_position":    m.bracket_position,
             "bracket_side":        getattr(m, "bracket_side", None),
+            "round_number":        m.round_number,
             "status":              str(m.status.value) if hasattr(m.status, "value") else str(m.status),
             "player1":             _profile_mini(p1),
             "player2":             _profile_mini(p2),
@@ -1329,8 +2075,15 @@ def get_bracket(
             "next_match_id":       str(m.next_match_id) if m.next_match_id is not None else None,
             "loser_next_match_id": str(m.loser_next_match_id) if getattr(m, "loser_next_match_id", None) is not None else None,
             "scheduled_at":        str(m.scheduled_at) if m.scheduled_at is not None else None,
+            "started_at":          str(m.started_at) if m.started_at is not None else None,
+            "best_of":             getattr(m, "best_of", None),
             "sets":                sets,
             "is_doubles":          is_dbl,
+            "court_id":            str(m.court_id) if m.court_id else None,
+            "court_name":          court_name,
+            "referee_id":          str(m.referee_id) if m.referee_id else None,
+            "referee_username":    ref.username if ref else None,
+            "referee_name":        f"{ref.first_name or ''} {ref.last_name or ''}".strip() if ref else None,
         }
 
         # For doubles include full team members so frontend can display "P1 / Partner"
@@ -1698,6 +2451,67 @@ def organizer_submit_score(
     if not body.sets:
         raise HTTPException(400, "At least one set score is required.")
 
+    # Sport-specific validation
+    sport_val = t.sport.value if hasattr(t.sport, "value") else str(t.sport)
+    rules = get_ruleset(sport_val)
+    if rules:
+        max_sets_allowed = rules.get("max_sets", 3)
+        pts_per_set = rules.get("points_per_set", 11)
+        win_by = rules.get("win_by", 2)
+        max_pts = rules.get("max_points")
+
+        if len(body.sets) > max_sets_allowed:
+            raise HTTPException(400, f"Maximum {max_sets_allowed} sets allowed for {rules['label']}.")
+
+        for i, s in enumerate(body.sets, start=1):
+            if s.p1_score < 0 or s.p2_score < 0:
+                raise HTTPException(400, f"Set {i}: Scores cannot be negative.")
+            
+            # Basic validation: someone must have reached the target points
+            if s.p1_score < pts_per_set and s.p2_score < pts_per_set:
+                # Exception: last set in tennis might be different, but for now we follow ruleset
+                pass 
+
+            # Max points check (e.g. 30 in badminton)
+            if max_pts:
+                if s.p1_score > max_pts or s.p2_score > max_pts:
+                    raise HTTPException(400, f"Set {i}: Scores cannot exceed {max_pts} for {rules['label']}.")
+    else:
+        # Fallback to generic 11-point, 3-set validation
+        if len(body.sets) > 3:
+            raise HTTPException(400, "Maximum 3 sets per match.")
+        for i, s in enumerate(body.sets, start=1):
+            if s.p1_score < 0 or s.p2_score < 0:
+                raise HTTPException(400, f"Set {i}: Scores cannot be negative.")
+
+    # Validate winner is consistent with set wins
+    p1_set_wins = 0
+    p2_set_wins = 0
+    for s in body.sets:
+        if rules:
+            pts = rules.get("points_per_set", 11)
+            wb  = rules.get("win_by", 2)
+            m_pts = rules.get("max_points")
+            
+            p1_won = (s.p1_score >= pts and s.p1_score - s.p2_score >= wb) or (m_pts and s.p1_score == m_pts)
+            p2_won = (s.p2_score >= pts and s.p2_score - s.p1_score >= wb) or (m_pts and s.p2_score == m_pts)
+            
+            if p1_won: p1_set_wins += 1
+            elif p2_won: p2_set_wins += 1
+        else:
+            if s.p1_score > s.p2_score: p1_set_wins += 1
+            elif s.p2_score > s.p1_score: p2_set_wins += 1
+
+    if p1_set_wins != p2_set_wins:
+        expected_winner = str(m.player1_id) if p1_set_wins > p2_set_wins else str(m.player2_id)
+        if body.winner_id != expected_winner:
+            raise HTTPException(
+                400,
+                f"Winner mismatch: set scores show {'Player 1' if p1_set_wins > p2_set_wins else 'Player 2'} won "
+                f"{max(p1_set_wins, p2_set_wins)}-{min(p1_set_wins, p2_set_wins)} sets. "
+                "Please correct the winner selection."
+            )
+
     # Force match to ongoing so we can set scores
     if status_val == "pending":
         setattr(m, "status", "ongoing")
@@ -1824,4 +2638,192 @@ def organizer_submit_score(
                         setattr(loser_m, "team2_player2", lose_partner)
 
     db.commit()
+    _update_pool_standing(m, body.winner_id, db)
+
+    # ── Auto-complete tournament when final match is done ─────────────────────
+    # Final match has no next_match_id and belongs to a tournament still "ongoing"
+    if m.tournament_id and getattr(m, "next_match_id", None) is None:
+        t = db.query(Tournament).filter(Tournament.id == m.tournament_id).first()
+        t_status = str(t.status.value if hasattr(t.status, "value") else t.status) if t else None
+        if t and t_status == "ongoing":
+            # Confirm all tournament matches are now completed
+            pending = db.query(Match).filter(
+                Match.tournament_id == m.tournament_id,
+                Match.status != "completed",
+                Match.player1_id.isnot(None),
+                Match.player2_id.isnot(None),
+            ).count()
+            if pending == 0:
+                setattr(t, "status", "completed")
+                db.commit()
+
     return {"message": "Score submitted and bracket advanced."}
+
+
+# ── Pool play helpers + endpoints ─────────────────────────────────────────────
+
+def _update_pool_standing(match: Match, winner_id: str, db: Session) -> None:
+    """Recalculate and persist pool standings after a pool-play match completes."""
+    if not match.tournament_id:
+        return
+    t = db.query(Tournament).filter(Tournament.id == match.tournament_id).first()
+    if not t or str(t.format) not in ("pool_play", "TournamentFormat.pool_play"):
+        return
+    bracket_side = getattr(match, "bracket_side", None) or ""
+    if not bracket_side.startswith("G"):
+        return
+
+    p1_id = str(match.player1_id) if match.player1_id else None
+    p2_id = str(match.player2_id) if match.player2_id else None
+    if not p1_id or not p2_id:
+        return
+
+    reg1 = db.query(TournamentRegistration).filter(
+        TournamentRegistration.tournament_id == match.tournament_id,
+        TournamentRegistration.player_id == p1_id,
+        TournamentRegistration.status == "confirmed",
+    ).first()
+    reg2 = db.query(TournamentRegistration).filter(
+        TournamentRegistration.tournament_id == match.tournament_id,
+        TournamentRegistration.player_id == p2_id,
+        TournamentRegistration.status == "confirmed",
+    ).first()
+    if not reg1 or not reg2:
+        return
+
+    s1 = db.query(TournamentGroupStanding).filter(TournamentGroupStanding.entry_id == reg1.id).first()
+    s2 = db.query(TournamentGroupStanding).filter(TournamentGroupStanding.entry_id == reg2.id).first()
+    if not s1 or not s2:
+        return
+
+    sets = db.query(MatchSet).filter(MatchSet.match_id == match.id).all()
+    p1_pts = sum((s.player1_score or 0) + (s.team1_score or 0) for s in sets)
+    p2_pts = sum((s.player2_score or 0) + (s.team2_score or 0) for s in sets)
+
+    is_p1_win = winner_id == p1_id
+    s1.played += 1
+    s1.wins   += 1 if is_p1_win else 0
+    s1.losses += 0 if is_p1_win else 1
+    s1.points_for     += p1_pts
+    s1.points_against += p2_pts
+    s1.point_diff      = s1.points_for - s1.points_against
+
+    s2.played += 1
+    s2.wins   += 0 if is_p1_win else 1
+    s2.losses += 1 if is_p1_win else 0
+    s2.points_for     += p2_pts
+    s2.points_against += p1_pts
+    s2.point_diff      = s2.points_for - s2.points_against
+
+    db.commit()
+
+
+@router.get("/{tournament_id}/pool-play-preview")
+def pool_play_preview(
+    tournament_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return pool-play format info for the current confirmed entry count — no changes made."""
+    t = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+    if not t:
+        raise HTTPException(404, "Tournament not found.")
+    if not _is_organizer(t, current_user["id"]):
+        raise HTTPException(403, "Not authorized.")
+
+    n = db.query(TournamentRegistration).filter(
+        TournamentRegistration.tournament_id == tournament_id,
+        TournamentRegistration.status == "confirmed",
+    ).count()
+
+    for gs in [4, 5, 3]:
+        if n % gs == 0 and (n // gs) >= 2:
+            num_groups   = n // gs
+            matches_each = gs * (gs - 1) // 2
+            return {
+                "valid": True,
+                "confirmed_entries": n,
+                "group_size": gs,
+                "num_groups": num_groups,
+                "matches_per_group": matches_each,
+                "total_matches": matches_each * num_groups,
+                "group_names": [f"Group {chr(ord('A') + i)}" for i in range(num_groups)],
+                "summary": f"{num_groups} Groups of {gs}",
+            }
+
+    return {
+        "valid": False,
+        "confirmed_entries": n,
+        "message": (
+            f"Pool play cannot be auto-generated: {n} entries cannot be divided evenly "
+            f"into equal groups of 3, 4, or 5. "
+            f"Valid counts include: 6, 8, 9, 10, 12, 15, 16, 20, 24, 25, 27…"
+        ),
+    }
+
+
+@router.get("/{tournament_id}/pool-groups")
+def get_pool_groups(
+    tournament_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return pool groups with members and live standings."""
+    t = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+    if not t:
+        raise HTTPException(404, "Tournament not found.")
+
+    groups = (
+        db.query(TournamentGroup)
+        .filter(TournamentGroup.tournament_id == tournament_id)
+        .order_by(TournamentGroup.group_order)
+        .all()
+    )
+
+    result = []
+    for g in groups:
+        members = db.query(TournamentGroupMember).filter(
+            TournamentGroupMember.tournament_group_id == g.id
+        ).all()
+
+        standings_map = {
+            str(s.entry_id): s
+            for s in db.query(TournamentGroupStanding).filter(
+                TournamentGroupStanding.group_id == g.id
+            ).all()
+        }
+
+        member_data = []
+        for mem in members:
+            reg    = db.query(TournamentRegistration).filter(TournamentRegistration.id == mem.entry_id).first()
+            player = db.query(Profile).filter(Profile.id == reg.player_id).first() if reg else None
+            st     = standings_map.get(str(mem.entry_id))
+            member_data.append({
+                "entry_id":   str(mem.entry_id),
+                "player_id":  str(reg.player_id) if reg else None,
+                "username":   player.username    if player else None,
+                "first_name": player.first_name  if player else None,
+                "last_name":  player.last_name   if player else None,
+                "seed":       mem.seed_number,
+                "standing": {
+                    "played":         st.played         if st else 0,
+                    "wins":           st.wins           if st else 0,
+                    "losses":         st.losses         if st else 0,
+                    "points_for":     st.points_for     if st else 0,
+                    "points_against": st.points_against if st else 0,
+                    "point_diff":     st.point_diff     if st else 0,
+                },
+            })
+
+        # Sort by wins desc, then point_diff desc
+        member_data.sort(key=lambda m: (-m["standing"]["wins"], -m["standing"]["point_diff"]))
+
+        result.append({
+            "id":          str(g.id),
+            "group_name":  g.group_name,
+            "group_order": g.group_order,
+            "group_size":  g.group_size,
+            "members":     member_data,
+        })
+
+    return result

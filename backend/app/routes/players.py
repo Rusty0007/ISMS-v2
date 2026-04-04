@@ -12,12 +12,28 @@ router = APIRouter()
 
 VALID_SPORTS = ["pickleball", "badminton", "lawn_tennis", "table_tennis"]
 
+# ── Skill level helper ────────────────────────────────────────────────────────
+
+def _skill_level(rating: float, rating_status: str) -> str:
+    if rating_status != "RATED":
+        return "Calibrating"
+    if rating < 1200:
+        return "Beginner"
+    if rating < 1500:
+        return "Intermediate"
+    if rating < 1800:
+        return "Advanced"
+    if rating < 2000:
+        return "Expert"
+    return "Elite"
+
 # ── Request Models ────────────────────────────────────────
 
 class UpdateProfileRequest(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     avatar_url: Optional[str] = None
+    gender: Optional[str] = None          # male | female | other
     region_code: Optional[str] = None
     province_code: Optional[str] = None
     city_mun_code: Optional[str] = None
@@ -56,6 +72,7 @@ def get_my_profile(
             "province_code": profile.province_code,
             "city_mun_code": profile.city_mun_code,
             "barangay_code": profile.barangay_code,
+            "gender": profile.gender,
             "profile_setup_complete": profile.profile_setup_complete,
             "created_at": str(profile.created_at),
         },
@@ -73,6 +90,7 @@ def get_my_profile(
                 "wins":                       r.wins,
                 "losses":                     r.losses,
                 "rating_status":              r.rating_status or "CALIBRATING",
+                "skill_level":                _skill_level(float(r.rating), r.rating_status or "CALIBRATING"),  # type: ignore[arg-type]
                 "calibration_matches_played": r.calibration_matches_played or 0,
                 "is_leaderboard_eligible":    bool(r.is_leaderboard_eligible),
                 "updated_at":                 str(r.updated_at),
@@ -128,6 +146,7 @@ def get_my_sports(
                 "matches_played": ratings_map[s.sport.value].matches_played,
                 "wins": ratings_map[s.sport.value].wins,
                 "losses": ratings_map[s.sport.value].losses,
+                "skill_level": _skill_level(float(ratings_map[s.sport.value].rating), ratings_map[s.sport.value].rating_status or "CALIBRATING"),  # type: ignore[arg-type]
             } if s.sport.value in ratings_map else None,
         }
         for s in sports

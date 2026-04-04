@@ -5,10 +5,11 @@ from pydantic import BaseModel
 from typing import Optional
 import uuid
 
-from datetime import date
+from datetime import date, timedelta, timezone
+import datetime as dt
 
 from app.database import get_db
-from app.models.models import Club, ClubMember, ClubCheckin, Court, CourtBooking, Profile, Match, PlayerRating
+from app.models.models import Club, ClubMember, ClubInvite, ClubCheckin, Court, CourtBooking, Profile, Match, PlayerRating
 from sqlalchemy import func
 from app.middleware.auth import get_current_user
 from app.services.notifications import send_notification
@@ -36,10 +37,14 @@ class UpdateClubRequest(BaseModel):
     category: Optional[str] = None
     membership_type: Optional[str] = None
     approval_mode: Optional[str] = None   # auto | manual
+    opening_time: Optional[str] = None   # HH:MM 24-hour
+    closing_time: Optional[str] = None   # HH:MM 24-hour
     address: Optional[str] = None
     region_code: Optional[str] = None
     province_code: Optional[str] = None
     city_mun_code: Optional[str] = None
+    logo_url: Optional[str] = None
+    cover_url: Optional[str] = None
 
 class SetMemberRoleRequest(BaseModel):
     role: str                              # member | admin | assistant
@@ -48,6 +53,13 @@ class SetMemberRoleRequest(BaseModel):
 class CreateCourtRequest(BaseModel):
     name: str
     sport: Optional[str] = None
+
+class ClubInviteRequest(BaseModel):
+    user_id: str
+    message: Optional[str] = None
+
+class RespondClubInviteRequest(BaseModel):
+    response: str  # "accepted" | "declined"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -102,28 +114,64 @@ def create_club(
 @router.get("")
 def list_clubs(
     sport: Optional[str] = None,
+    mode: Optional[str] = None,  # "nearby" | "explore" | None
+    q: Optional[str] = None,      # name search
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    q = db.query(Club).filter(Club.is_active == True)  # noqa: E712
+    user_id = uuid.UUID(current_user["id"])
+    query = db.query(Club).filter(Club.is_active == True)  # noqa: E712
     if sport:
-        q = q.filter(Club.sport == sport)
-    clubs = q.order_by(Club.created_at.desc()).all()
+        query = query.filter(Club.sport == sport)
+    if q:
+        query = query.filter(Club.name.ilike(f"%{q}%"))
 
-    return [
-        {
+    def _serialize(c: Club, proximity: Optional[str] = None) -> dict:
+        return {
             "id": str(c.id),
             "name": c.name,
             "description": c.description,
             "sport": c.sport.value if c.sport is not None else None,
+            "category": c.category,
             "admin_id": str(c.admin_id),
             "city_mun_code": c.city_mun_code,
             "province_code": c.province_code,
+            "logo_url": c.logo_url,
+            "cover_url": c.cover_url,
             "member_count": db.query(ClubMember).filter(ClubMember.club_id == c.id).count(),
             "court_count": db.query(Court).filter(Court.club_id == c.id).count(),
+            "proximity": proximity,
         }
-        for c in clubs
-    ]
+
+    if mode == "nearby":
+        profile = db.query(Profile).filter(Profile.id == user_id).first()
+        proximity = None
+        clubs: list = []
+        if profile:
+            if profile.city_mun_code is not None:
+                clubs = query.filter(Club.city_mun_code == profile.city_mun_code).all()
+                if clubs:
+                    proximity = "city"
+            if not clubs and profile.province_code is not None:
+                clubs = query.filter(Club.province_code == profile.province_code).all()
+                if clubs:
+                    proximity = "province"
+            if not clubs and profile.region_code is not None:
+                clubs = query.filter(Club.region_code == profile.region_code).all()
+                if clubs:
+                    proximity = "region"
+        if not clubs:
+            clubs = query.order_by(Club.created_at.desc()).all()
+        return [_serialize(c, proximity) for c in clubs]
+
+    if mode == "explore":
+        clubs = query.all()
+        serialized = [_serialize(c) for c in clubs]
+        return sorted(serialized, key=lambda x: (x["member_count"], x["court_count"]), reverse=True)
+
+    # default — all clubs, newest first
+    clubs = query.order_by(Club.created_at.desc()).all()
+    return [_serialize(c) for c in clubs]
 
 
 @router.get("/mine")
@@ -179,6 +227,176 @@ def search_addresses(
     ]
 
 
+# ── Club Invites ────────────────────────────────────────────────────────────
+
+@router.get("/my-invites")
+def my_club_invites(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    user_id = uuid.UUID(current_user["id"])
+    now = dt.datetime.now(dt.timezone.utc)
+    invites = (
+        db.query(ClubInvite)
+        .filter(
+            ClubInvite.invited_user == user_id,
+            ClubInvite.status == "pending",
+            ClubInvite.expires_at > now,
+        )
+        .order_by(ClubInvite.created_at.desc())
+        .all()
+    )
+    result = []
+    for inv in invites:
+        club = db.query(Club).filter(Club.id == inv.club_id).first()
+        inviter = db.query(Profile).filter(Profile.id == inv.invited_by).first()
+        result.append({
+            "invite_id":           str(inv.id),
+            "club_id":             str(inv.club_id),
+            "club_name":           club.name if club else None,
+            "sport":               club.sport.value if club is not None and club.sport is not None else None,
+            "category":            club.category if club else None,
+            "invited_by_username": inviter.username if inviter else None,
+            "message":             inv.message,
+            "expires_at":          str(inv.expires_at),
+            "created_at":          str(inv.created_at),
+        })
+    return result
+
+
+@router.post("/{club_id}/invite", status_code=201)
+def send_club_invite(
+    club_id: str,
+    data: ClubInviteRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    current_id = uuid.UUID(current_user["id"])
+    club = _club_or_404(db, club_id)
+    _require_admin(club, current_id)
+
+    try:
+        target_id = uuid.UUID(data.user_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid user_id.")
+
+    # Must not already be a member
+    if db.query(ClubMember).filter(ClubMember.club_id == club.id, ClubMember.user_id == target_id).first():
+        raise HTTPException(400, "User is already a member of this club.")
+
+    # No duplicate pending invite
+    now = dt.datetime.now(dt.timezone.utc)
+    existing = db.query(ClubInvite).filter(
+        ClubInvite.club_id == club.id,
+        ClubInvite.invited_user == target_id,
+        ClubInvite.status == "pending",
+        ClubInvite.expires_at > now,
+    ).first()
+    if existing:
+        raise HTTPException(400, "A pending invite already exists for this user.")
+
+    inviter = db.query(Profile).filter(Profile.id == current_id).first()
+    invite = ClubInvite(
+        club_id      = club.id,
+        invited_by   = current_id,
+        invited_user = target_id,
+        message      = data.message,
+        expires_at   = now + timedelta(days=7),
+    )
+    db.add(invite)
+    db.commit()
+    db.refresh(invite)
+
+    send_notification(
+        user_id      = str(target_id),
+        title        = "Club Invitation",
+        body         = f"@{inviter.username if inviter else 'Admin'} invited you to join {club.name}.",
+        notif_type   = "club_invite",
+        reference_id = str(invite.id),
+    )
+    return {"invite_id": str(invite.id), "message": "Invite sent."}
+
+
+@router.post("/invites/{invite_id}/respond")
+def respond_club_invite(
+    invite_id: str,
+    data: RespondClubInviteRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    user_id = uuid.UUID(current_user["id"])
+    if data.response not in ("accepted", "declined"):
+        raise HTTPException(400, "response must be 'accepted' or 'declined'.")
+
+    invite = db.query(ClubInvite).filter(ClubInvite.id == uuid.UUID(invite_id)).first()
+    if not invite:
+        raise HTTPException(404, "Invite not found.")
+    if str(invite.invited_user) != str(user_id):
+        raise HTTPException(403, "Not your invite.")
+
+    now = dt.datetime.now(dt.timezone.utc)
+    expires_at = invite.expires_at
+    if expires_at is not None and expires_at.replace(tzinfo=dt.timezone.utc) < now:
+        raise HTTPException(400, "This invite has expired.")
+    if str(invite.status) != "pending":
+        raise HTTPException(400, "Invite already responded to.")
+
+    invitee = db.query(Profile).filter(Profile.id == user_id).first()
+    club    = db.query(Club).filter(Club.id == invite.club_id).first()
+
+    setattr(invite, "status", data.response)
+    setattr(invite, "responded_at", now)
+
+    if data.response == "accepted":
+        # Avoid duplicate membership (race condition guard)
+        if not db.query(ClubMember).filter(
+            ClubMember.club_id == invite.club_id,
+            ClubMember.user_id == user_id,
+        ).first():
+            db.add(ClubMember(club_id=invite.club_id, user_id=user_id, role="member"))
+        send_notification(
+            user_id      = str(invite.invited_by),
+            title        = "Invite Accepted",
+            body         = f"@{invitee.username if invitee else 'Someone'} joined {club.name if club else 'your club'}.",
+            notif_type   = "club_invite_accepted",
+            reference_id = str(invite.club_id),
+        )
+    else:
+        send_notification(
+            user_id      = str(invite.invited_by),
+            title        = "Invite Declined",
+            body         = f"@{invitee.username if invitee else 'Someone'} declined your invite to {club.name if club else 'your club'}.",
+            notif_type   = "club_invite_declined",
+            reference_id = str(invite.club_id),
+        )
+
+    db.commit()
+    return {"message": f"Invite {data.response}."}
+
+
+@router.get("/pending-requests")
+def pending_club_requests(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Return count of pending match approvals across all clubs where the user is admin."""
+    user_id = uuid.UUID(current_user["id"])
+    admin_clubs = db.query(ClubMember).filter(
+        ClubMember.user_id == user_id,
+        ClubMember.role.in_(["admin", "assistant"]),
+    ).all()
+    club_ids = [str(m.club_id) for m in admin_clubs]
+
+    count = 0
+    if club_ids:
+        count = db.query(Match).filter(
+            Match.club_id.in_(club_ids),
+            Match.status == "pending_approval",
+        ).count()
+
+    return {"count": count, "requests": []}
+
+
 @router.get("/{club_id}")
 def get_club(
     club_id: str,
@@ -202,6 +420,10 @@ def get_club(
         "region_code": club.region_code,
         "province_code": club.province_code,
         "city_mun_code": club.city_mun_code,
+        "logo_url": club.logo_url,
+        "cover_url": club.cover_url,
+        "opening_time": getattr(club, "opening_time", None) or "06:00",
+        "closing_time": getattr(club, "closing_time", None) or "22:00",
         "is_active": club.is_active,
         "created_at": str(club.created_at),
         "member_count": db.query(ClubMember).filter(ClubMember.club_id == club.id).count(),
@@ -244,12 +466,20 @@ def update_club(
         if data.approval_mode not in ("auto", "manual"):
             raise HTTPException(400, "approval_mode must be 'auto' or 'manual'.")
         setattr(club, "approval_mode", data.approval_mode)
+    if data.logo_url is not None:
+        setattr(club, "logo_url", data.logo_url)
+    if data.cover_url is not None:
+        setattr(club, "cover_url", data.cover_url)
+    if data.opening_time is not None:
+        setattr(club, "opening_time", data.opening_time)
+    if data.closing_time is not None:
+        setattr(club, "closing_time", data.closing_time)
 
     db.commit()
     return {"message": "Club updated."}
 
 
-# ── Members ────────────────────────────────────────────────────────────────
+#  Members 
 
 @router.post("/{club_id}/join")
 def join_club(
@@ -626,3 +856,74 @@ def reject_match(
                 reference_id = str(match.id),
             )
     return {"message": "Match rejected. Court released."}
+
+
+@router.get("/{club_id}/rankings")
+def get_club_rankings(
+    club_id: str,
+    sport: str,
+    match_format: str = "singles",   # singles | doubles | mixed_doubles
+    gender: Optional[str] = None,    # male | female | other | None (all)
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    club = _club_or_404(db, club_id)
+
+    # Build query: club members → player_ratings → profiles
+    q = (
+        db.query(
+            Profile.id,
+            Profile.username,
+            Profile.first_name,
+            Profile.last_name,
+            Profile.avatar_url,
+            Profile.gender,
+            PlayerRating.rating,
+            PlayerRating.rating_deviation,
+            PlayerRating.matches_played,
+            PlayerRating.wins,
+            PlayerRating.losses,
+            PlayerRating.rating_status,
+            PlayerRating.is_leaderboard_eligible,
+        )
+        .join(ClubMember, ClubMember.user_id == Profile.id)
+        .join(
+            PlayerRating,
+            (PlayerRating.user_id == Profile.id) &
+            (PlayerRating.sport == sport) &
+            (PlayerRating.match_format == match_format),
+        )
+        .filter(ClubMember.club_id == club.id)
+    )
+
+    if gender:
+        q = q.filter(Profile.gender == gender)
+
+    rows = q.order_by(PlayerRating.rating.desc()).limit(limit).all()
+
+    return {
+        "club_id":      str(club.id),
+        "sport":        sport,
+        "match_format": match_format,
+        "gender":       gender,
+        "rankings": [
+            {
+                "rank":                  idx + 1,
+                "id":                    str(r.id),
+                "username":              r.username,
+                "first_name":            r.first_name,
+                "last_name":             r.last_name,
+                "avatar_url":            r.avatar_url,
+                "gender":                r.gender,
+                "rating":                float(r.rating),
+                "rating_deviation":      float(r.rating_deviation),
+                "matches_played":        r.matches_played,
+                "wins":                  r.wins,
+                "losses":                r.losses,
+                "rating_status":         r.rating_status,
+                "is_leaderboard_eligible": bool(r.is_leaderboard_eligible),
+            }
+            for idx, r in enumerate(rows)
+        ],
+    }

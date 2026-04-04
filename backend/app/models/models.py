@@ -20,6 +20,7 @@ class SportType(str, enum.Enum):
 
 class MatchType(str, enum.Enum):
     queue      = "queue"
+    ranked     = "ranked"
     friendly   = "friendly"
     book       = "book"
     tournament = "tournament"
@@ -33,9 +34,11 @@ class MatchStatus(str, enum.Enum):
     pending          = "pending"
     assembling       = "assembling"
     pending_approval = "pending_approval"
+    awaiting_players = "awaiting_players"
     ongoing          = "ongoing"
     completed        = "completed"
     cancelled        = "cancelled"
+    invalidated      = "invalidated"
 
 class TournamentFormat(str, enum.Enum):
     single_elimination   = "single_elimination"
@@ -43,6 +46,7 @@ class TournamentFormat(str, enum.Enum):
     round_robin          = "round_robin"
     swiss                = "swiss"
     group_stage_knockout = "group_stage_knockout"
+    pool_play            = "pool_play"
 
 class UserRole(str, enum.Enum):
     player               = "player"
@@ -73,6 +77,7 @@ class Profile(Base):
     province_code          = Column(String)
     city_mun_code          = Column(String)
     barangay_code          = Column(String)
+    gender                 = Column(String)                  # male | female | other
     profile_setup_complete = Column(Boolean, default=False)
     referee_boost_until    = Column(TIMESTAMP(timezone=True))
     fcm_token              = Column(String)
@@ -140,6 +145,7 @@ class Club(Base):
     name            = Column(String, unique=True, nullable=False)
     description     = Column(Text)
     logo_url        = Column(Text)
+    cover_url       = Column(Text)
     admin_id        = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
     sport           = Column(SAEnum(SportType, name="sport_type"))
     category        = Column(String)   # community | school | private | municipal | barangay | academy | venue
@@ -149,6 +155,8 @@ class Club(Base):
     province_code   = Column(String)
     city_mun_code   = Column(String)
     approval_mode   = Column(String, default="auto")   # auto | manual
+    opening_time    = Column(String, default="06:00")  # HH:MM 24-hour
+    closing_time    = Column(String, default="22:00")  # HH:MM 24-hour
     is_active       = Column(Boolean, default=True)
     created_at      = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
@@ -167,6 +175,96 @@ class ClubMember(Base):
 
     club       = relationship("Club", back_populates="members")
 
+class ClubInvite(Base):
+    __tablename__ = "club_invites"
+
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    club_id      = Column(UUID(as_uuid=True), ForeignKey("clubs.id", ondelete="CASCADE"), nullable=False)
+    invited_by   = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
+    invited_user = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
+    status       = Column(String, nullable=False, default="pending")  # pending | accepted | declined
+    message      = Column(Text)
+    expires_at   = Column(TIMESTAMP(timezone=True))
+    responded_at = Column(TIMESTAMP(timezone=True))
+    created_at   = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class OpenPlaySession(Base):
+    __tablename__ = "open_play_sessions"
+
+    id             = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    club_id        = Column(UUID(as_uuid=True), ForeignKey("clubs.id", ondelete="CASCADE"), nullable=False)
+    court_id       = Column(UUID(as_uuid=True), ForeignKey("courts.id", ondelete="SET NULL"))
+    created_by     = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
+    title          = Column(String, nullable=False)
+    description    = Column(Text)
+    sport          = Column(String, nullable=False)
+    session_date   = Column(TIMESTAMP(timezone=True), nullable=False)
+    duration_hours = Column(Numeric, default=1)
+    max_players    = Column(Integer, nullable=False)
+    price_per_head = Column(Numeric, default=0)
+    status         = Column(String, nullable=False, default="upcoming")  # upcoming|ongoing|completed|cancelled
+    skill_min      = Column(Numeric)
+    skill_max      = Column(Numeric)
+    notes          = Column(Text)
+    created_at     = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    participants   = relationship("OpenPlayParticipant", back_populates="session", cascade="all, delete")
+
+
+class OpenPlayParticipant(Base):
+    __tablename__ = "open_play_participants"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("open_play_sessions.id", ondelete="CASCADE"), nullable=False)
+    user_id    = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    status     = Column(String, nullable=False, default="confirmed")  # confirmed|waitlisted|cancelled
+    joined_at  = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    session    = relationship("OpenPlaySession", back_populates="participants")
+
+
+class Party(Base):
+    __tablename__ = "parties"
+
+    id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    leader_id        = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    sport            = Column(String, nullable=False)
+    match_format     = Column(String, nullable=False, default="doubles")  # doubles|mixed_doubles
+    status           = Column(String, nullable=False, default="forming")  # forming|ready|in_queue|match_found|disbanded
+    match_id         = Column(UUID(as_uuid=True), ForeignKey("matches.id", ondelete="SET NULL"))
+    queue_started_at = Column(TIMESTAMP(timezone=True))
+    created_at       = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    members      = relationship("PartyMember", back_populates="party", cascade="all, delete")
+    invitations  = relationship("PartyInvitation", back_populates="party", cascade="all, delete")
+
+
+class PartyMember(Base):
+    __tablename__ = "party_members"
+
+    id        = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    party_id  = Column(UUID(as_uuid=True), ForeignKey("parties.id", ondelete="CASCADE"), nullable=False)
+    user_id   = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    role      = Column(String, nullable=False, default="member")  # leader|member
+    joined_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    party     = relationship("Party", back_populates="members")
+
+
+class PartyInvitation(Base):
+    __tablename__ = "party_invitations"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    party_id    = Column(UUID(as_uuid=True), ForeignKey("parties.id", ondelete="CASCADE"), nullable=False)
+    inviter_id  = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    invitee_id  = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    status      = Column(String, nullable=False, default="pending")  # pending|accepted|declined
+    created_at  = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    party       = relationship("Party", back_populates="invitations")
+
+
 class ClubCheckin(Base):
     __tablename__ = "club_checkins"
 
@@ -182,7 +280,7 @@ class Court(Base):
     __tablename__ = "courts"
 
     id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    club_id    = Column(UUID(as_uuid=True), ForeignKey("clubs.id", ondelete="CASCADE"), nullable=False)
+    club_id    = Column(UUID(as_uuid=True), ForeignKey("clubs.id", ondelete="SET NULL"), nullable=True)
     name       = Column(String, nullable=False)
     sport      = Column(String)
     surface    = Column(String)   # sport-specific: Wooden, Clay, Acrylic, etc.
@@ -190,8 +288,14 @@ class Court(Base):
     lighting   = Column(String, default="good")  # good | fair | poor
     capacity   = Column(Integer)
     notes      = Column(Text)
+    address    = Column(Text)
+    region_code     = Column(String)
+    province_code   = Column(String)
+    city_mun_code   = Column(String)
     status     = Column(String, nullable=False, default="available")
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    image_url  = Column(Text)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("profiles.id"))
 
 
 class CourtBooking(Base):
@@ -200,7 +304,7 @@ class CourtBooking(Base):
     id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     court_id     = Column(UUID(as_uuid=True), ForeignKey("courts.id", ondelete="CASCADE"), nullable=False)
     match_id     = Column(UUID(as_uuid=True), ForeignKey("matches.id", ondelete="CASCADE"))
-    club_id      = Column(UUID(as_uuid=True), ForeignKey("clubs.id", ondelete="CASCADE"), nullable=False)
+    club_id      = Column(UUID(as_uuid=True), ForeignKey("clubs.id", ondelete="SET NULL"), nullable=True)
     requested_by = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
     scheduled_at = Column(TIMESTAMP(timezone=True))
     status       = Column(String, nullable=False, default="pending_approval")
@@ -234,8 +338,10 @@ class Tournament(Base):
     # registration eligibility
     min_rating        = Column(Numeric)
     max_rating        = Column(Numeric)
-    requires_approval = Column(Boolean, default=False, nullable=False)
-    created_at        = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    requires_approval  = Column(Boolean, default=False, nullable=False)
+    # 1 = Best of 1 (single game), 3 = Best of 3 (first to win 2 games)
+    knockout_best_of   = Column(Integer, default=3, nullable=False)
+    created_at         = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
 class Match(Base):
@@ -264,6 +370,8 @@ class Match(Base):
     next_match_id         = Column(UUID(as_uuid=True), ForeignKey("matches.id"))
     bracket_side          = Column(String)   # W, L, GF, G0..Gn, K
     loser_next_match_id   = Column(UUID(as_uuid=True), ForeignKey("matches.id"))
+    best_of             = Column(Integer)   # per-match override: 1, 3, or 5 (None = use tournament/sport default)
+    score_limit         = Column(Integer)   # per-match points-per-set override: 11, 15, or 21
     ml_match_score      = Column(Numeric)
     queue_city_code     = Column(String)   # resolved play location snapshot at queue-join time
     queue_province_code = Column(String)
@@ -301,6 +409,18 @@ class MatchAcceptance(Base):
     user_id     = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
     decision    = Column(String, nullable=False)
     decided_at  = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class MatchLobbyPlayer(Base):
+    __tablename__ = "match_lobby_players"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    match_id    = Column(UUID(as_uuid=True), ForeignKey("matches.id", ondelete="CASCADE"), nullable=False)
+    user_id     = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    team_no     = Column(Integer, nullable=False)   # 1 or 2
+    status      = Column(String, nullable=False, default="pending")  # pending | entered
+    entered_at  = Column(TIMESTAMP(timezone=True))
+    notified_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
 class ShotType(Base):
@@ -370,11 +490,49 @@ class TournamentRegistration(Base):
     player_id     = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
     partner_id    = Column(UUID(as_uuid=True), ForeignKey("profiles.id"))
     seed          = Column(Integer)
-    # confirmed | invited | pending_approval | declined
+    # confirmed | invited | pending_approval | pending_partner | declined
     status        = Column(String, default="confirmed", nullable=False)
     # self_registered | organizer_invited
     source        = Column(String, default="self_registered", nullable=False)
     registered_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class TournamentGroup(Base):
+    __tablename__ = "tournament_groups"
+
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tournament_id = Column(UUID(as_uuid=True), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
+    group_name    = Column(String, nullable=False)   # "Group A", "Group B", …
+    group_order   = Column(Integer, nullable=False, default=0)
+    group_size    = Column(Integer, nullable=False)
+    created_at    = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class TournamentGroupMember(Base):
+    __tablename__ = "tournament_group_members"
+
+    id                  = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tournament_group_id = Column(UUID(as_uuid=True), ForeignKey("tournament_groups.id", ondelete="CASCADE"), nullable=False)
+    entry_id            = Column(UUID(as_uuid=True), ForeignKey("tournament_registrations.id", ondelete="CASCADE"), nullable=False)
+    seed_number         = Column(Integer)
+    assigned_at         = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class TournamentGroupStanding(Base):
+    __tablename__ = "tournament_group_standings"
+
+    id             = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tournament_id  = Column(UUID(as_uuid=True), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
+    group_id       = Column(UUID(as_uuid=True), ForeignKey("tournament_groups.id", ondelete="CASCADE"), nullable=False)
+    entry_id       = Column(UUID(as_uuid=True), ForeignKey("tournament_registrations.id", ondelete="CASCADE"), nullable=False)
+    played         = Column(Integer, default=0, nullable=False)
+    wins           = Column(Integer, default=0, nullable=False)
+    losses         = Column(Integer, default=0, nullable=False)
+    points_for     = Column(Integer, default=0, nullable=False)
+    points_against = Column(Integer, default=0, nullable=False)
+    point_diff     = Column(Integer, default=0, nullable=False)
+    rank           = Column(Integer, default=0, nullable=False)
+    updated_at     = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
 class MatchmakingQueue(Base):

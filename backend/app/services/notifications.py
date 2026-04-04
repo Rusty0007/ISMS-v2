@@ -6,6 +6,29 @@ from app.models.models import Notification, Profile
 
 logger = logging.getLogger(__name__)
 
+# ── Redis pub/sub for real-time notification SSE ──────────────────────────────
+_NOTIF_PREFIX = "isms:notif:"
+
+try:
+    import redis as _redis_sync
+    from app.config import settings as _settings
+    _redis_notif = _redis_sync.from_url(_settings.redis_url, decode_responses=True)
+    _redis_notif.ping()
+    logger.info("[notifications] Redis pub/sub enabled — real-time SSE notifications active.")
+except Exception as _e:
+    _redis_notif = None
+    logger.warning(f"[notifications] Redis unavailable — SSE notifications disabled. Reason: {_e}")
+
+
+def _publish_notif(user_id: str) -> None:
+    """Signal the user's SSE stream that a new notification is waiting."""
+    if _redis_notif is None:
+        return
+    try:
+        _redis_notif.publish(f"{_NOTIF_PREFIX}{user_id}", "new")
+    except Exception as e:
+        logger.warning(f"[notifications] Redis publish failed for {user_id}: {e}")
+
 # ── Firebase Admin SDK (optional — only initialised if credentials file exists) ─
 _fcm_ready = False
 try:
@@ -74,6 +97,9 @@ def send_notification(
         fcm_token = str(profile.fcm_token) if profile and profile.fcm_token is not None else None
         if fcm_token:
             _send_fcm(fcm_token, title, body, notif_type, reference_id)
+
+        # Signal real-time SSE stream
+        _publish_notif(user_id)
 
     except Exception as e:
         logger.error(f"Failed to send notification to {user_id}: {e}")

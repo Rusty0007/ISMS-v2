@@ -208,7 +208,7 @@ def list_all_tournaments(
             "organizer":   organizer.username if organizer else None,
             "organizer_id": str(t.organizer_id),
             "participants": participant_count,
-            "max_players": t.max_players,
+            "max_players": t.max_participants,
             "created_at":  t.created_at.isoformat() if t.created_at else None,
         })
 

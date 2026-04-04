@@ -7,8 +7,8 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.models import (
-    Match, Profile, UserRoleModel, ClubCheckin,
-    RefereeInvite, RefereeOpenRequest, Notification
+    Match, MatchStatus, Profile, UserRoleModel, ClubCheckin,
+    RefereeInvite, RefereeOpenRequest, Notification, Court, Party, MatchHistory
 )
 from app.services.notifications import send_notification, send_bulk_notifications
 from app.services.broadcast import broadcast_match
@@ -54,13 +54,14 @@ def send_referee_invite(
     if match.status.value not in ("pending", "ongoing"):
         raise HTTPException(400, "Cannot assign a referee to this match.")
 
-    # Check no pending invite already
-    pending = db.query(RefereeInvite).filter(
+    # Prevent the same user being invited twice for the same match
+    already = db.query(RefereeInvite).filter(
         RefereeInvite.match_id == data.match_id,
+        RefereeInvite.invited_user == data.invited_user,
         RefereeInvite.status == "pending",
     ).first()
-    if pending:
-        raise HTTPException(400, "There is already a pending referee invite for this match.")
+    if already:
+        raise HTTPException(400, "This user already has a pending invite for this match.")
 
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=INVITE_EXPIRY_MINUTES)
 
@@ -76,6 +77,8 @@ def send_referee_invite(
 
     inviter = db.query(Profile).filter(Profile.id == invited_by).first()
     inviter_name = f"{inviter.first_name} {inviter.last_name}" if inviter else "A player"
+    invitee = db.query(Profile).filter(Profile.id == data.invited_user).first()
+    invitee_username = str(invitee.username) if invitee else "someone"
 
     send_notification(
         user_id=data.invited_user,
@@ -89,6 +92,17 @@ def send_referee_invite(
         notif_type="referee_invite",
         reference_id=str(invite.id),
     )
+
+    # Broadcast to all match participants so their consoles update in real-time
+    broadcast_match(str(data.match_id), {
+        "type":              "referee_invite_sent",
+        "invite_id":         str(invite.id),
+        "invited_by":        invited_by,
+        "invited_by_name":   inviter_name,
+        "invited_user":      data.invited_user,
+        "invited_username":  invitee_username,
+        "expires_at":        expires_at.isoformat(),
+    })
 
     return {
         "message": f"Referee invite sent. Expires in {INVITE_EXPIRY_MINUTES} minutes.",
@@ -125,6 +139,19 @@ def respond_to_invite(
 
     setattr(invite, "status", data.response)
     setattr(invite, "responded_at", datetime.now(timezone.utc))
+
+    # Mark the corresponding referee_invite notification as read and update its type
+    # so the Accept/Decline buttons don't reappear after fetchNotifications() is called.
+    notif = db.query(Notification).filter(
+        Notification.user_id == user_id,
+        Notification.type == "referee_invite",
+        Notification.data["reference_id"].astext == invite_id,
+    ).first()
+    if notif:
+        new_type = "referee_accepted" if data.response == "accepted" else "referee_declined"
+        setattr(notif, "type", new_type)
+        setattr(notif, "is_read", True)
+
     db.commit()
 
     responder = db.query(Profile).filter(Profile.id == user_id).first()
@@ -152,19 +179,38 @@ def respond_to_invite(
         if checkin:
             setattr(checkin, "status", "playing")
 
+        # Cancel all other pending invites for this match (race condition: first accept wins)
+        other_pending = db.query(RefereeInvite).filter(
+            RefereeInvite.match_id == invite.match_id,
+            RefereeInvite.id != invite.id,
+            RefereeInvite.status == "pending",
+        ).all()
+        cancelled_ids = []
+        for other in other_pending:
+            setattr(other, "status", "cancelled")
+            cancelled_ids.append(str(other.id))
+
         db.commit()
 
         send_notification(
             user_id=str(invite.invited_by),
             title="Referee Accepted ✅",
             body=f"{responder_name} has accepted to referee your match!",
-            notif_type="referee_invite",
+            notif_type="referee_accepted",
             reference_id=str(invite.match_id),
         )
 
         broadcast_match(str(invite.match_id), {
-            "type": "referee_assigned",
-            "referee_id": user_id,
+            "type":              "referee_assigned",
+            "referee_id":        user_id,
+            "referee_username":  str(responder.username) if responder else "",
+            "invite_id":         str(invite.id),
+            "cancelled_invites": cancelled_ids,
+        })
+
+        broadcast_match(str(invite.match_id), {
+            "type":    "match_announcement",
+            "message": f"🏅 {responder_name} has joined as referee. Let the game begin!",
         })
 
         return {
@@ -178,9 +224,16 @@ def respond_to_invite(
             user_id=str(invite.invited_by),
             title="Referee Declined ❌",
             body=f"{responder_name} declined your referee invite. You can invite someone else.",
-            notif_type="referee_invite",
+            notif_type="referee_declined",
             reference_id=str(invite.match_id),
         )
+
+        broadcast_match(str(invite.match_id), {
+            "type":      "referee_invite_declined",
+            "invite_id": str(invite.id),
+            "declined_username": str(responder.username) if responder else "",
+        })
+
         return {"message": "Invite declined. The match organizer has been notified."}
 
 
@@ -203,6 +256,60 @@ def get_invite(
             "expires_at": str(invite.expires_at) if invite.expires_at is not None else None,
         }
     }
+
+
+# ── Pending invites for a match ──────────────────────────
+
+@router.get("/matches/{match_id}/referee-invites")
+def get_match_referee_invites(
+    match_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Returns all non-expired pending/declined/cancelled referee invites for a match."""
+    now = datetime.now(timezone.utc)
+
+    invites = db.query(RefereeInvite).filter(
+        RefereeInvite.match_id == match_id,
+        RefereeInvite.status.in_(["pending", "declined", "cancelled"]),
+    ).order_by(RefereeInvite.id.asc()).all()
+
+    # Batch-fetch profiles for inviters and invitees
+    user_ids = set()
+    for inv in invites:
+        user_ids.add(str(inv.invited_by))
+        user_ids.add(str(inv.invited_user))
+    profiles = db.query(Profile).filter(Profile.id.in_(list(user_ids))).all()
+    prof_map: dict = {str(p.id): p for p in profiles}
+
+    def _name(uid: str) -> str:
+        p = prof_map.get(uid)
+        if not p:
+            return uid[:8]
+        return f"{p.first_name} {p.last_name}".strip() or str(p.username)  # type: ignore[arg-type]
+
+    def _username(uid: str) -> str:
+        p = prof_map.get(uid)
+        return str(p.username) if p else uid[:8]
+
+    result = []
+    for inv in invites:
+        # Auto-expire stale pending invites in the response (don't mutate DB here)
+        status = str(inv.status)
+        if status == "pending" and inv.expires_at is not None:
+            if now > inv.expires_at:  # type: ignore[operator]
+                status = "expired"
+        result.append({
+            "invite_id":         str(inv.id),
+            "invited_by":        str(inv.invited_by),
+            "invited_by_name":   _name(str(inv.invited_by)),
+            "invited_user":      str(inv.invited_user),
+            "invited_username":  _username(str(inv.invited_user)),
+            "status":            status,
+            "expires_at":        inv.expires_at.isoformat() if inv.expires_at is not None else None,
+        })
+
+    return {"invites": result}
 
 
 # ── Open Referee Request ──────────────────────────────────
@@ -406,6 +513,79 @@ def get_my_referee_matches(
     }
 
 
+# ── Referee Leave ─────────────────────────────────────────
+
+@router.post("/referee/{match_id}/leave")
+def referee_leave_match(
+    match_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Called when the assigned referee voluntarily leaves a pending or ongoing match.
+    The match is immediately invalidated and all players are notified.
+    """
+    user_id = current_user["id"]
+
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found.")
+    if match.referee_id is None or str(match.referee_id) != user_id:
+        raise HTTPException(status_code=403, detail="You are not the referee for this match.")
+    if match.status.value not in ("pending", "assembling", "ongoing"):
+        raise HTTPException(status_code=400, detail="Match is not in an active state.")
+
+    # Invalidate the match
+    setattr(match, "status", MatchStatus.invalidated)
+
+    # Invalidated matches should not retain user-facing timelines.
+    db.query(MatchHistory).filter(MatchHistory.match_id == match_id).delete(synchronize_session=False)
+
+    # Release the court if one was assigned
+    if match.court_id is not None:
+        court = db.query(Court).filter(Court.id == match.court_id).first()
+        if court is not None:
+            setattr(court, "status", "available")
+
+    db.flush()
+
+    # Collect all player IDs to notify
+    player_ids = [
+        str(pid) for pid in [
+            match.player1_id, match.player2_id,
+            match.player3_id, match.player4_id,
+        ]
+        if pid is not None and str(pid) != user_id
+    ]
+
+    referee = db.query(Profile).filter(Profile.id == user_id).first()
+    ref_name = f"{referee.first_name} {referee.last_name}".strip() if referee else "The referee"
+
+    phase = "live match" if match.status.value == "ongoing" else "lobby"
+
+    if player_ids:
+        send_bulk_notifications(
+            user_ids    = player_ids,
+            notif_type  = "referee_left",
+            title       = "Match Invalidated",
+            body        = f"{ref_name} left the {phase}. The match has been invalidated.",
+            reference_id= match_id,
+        )
+
+    # Disband any party whose match_id points to this now-invalidated match
+    linked_parties = db.query(Party).filter(Party.match_id == match.id).all()
+    for linked_party in linked_parties:
+        setattr(linked_party, "status", "disbanded")
+        setattr(linked_party, "match_id", None)
+
+    db.commit()
+
+    # Broadcast so the match page updates in real-time
+    broadcast_match(match_id, {"type": "match_invalidated", "reason": "referee_left"})
+
+    return {"message": "You have left the match. The match has been invalidated."}
+
+
 # ── Notifications ─────────────────────────────────────────
 
 @router.get("/notifications")
@@ -431,6 +611,7 @@ def get_notifications(
                 "id": str(n.id), "type": n.type,
                 "title": n.title, "body": n.body,
                 "is_read": n.is_read, "data": n.data,
+                "reference_id": (n.data or {}).get("reference_id") if isinstance(n.data, dict) else None,
                 "created_at": str(n.created_at),
             } for n in notifications
         ],

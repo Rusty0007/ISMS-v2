@@ -10,6 +10,74 @@ logger = logging.getLogger(__name__)
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
+
+# ══════════════════════════════════════════════════════════
+# MODE CONFIG  — controls per-mode geo filter, quality
+#               threshold, and wait-time weight
+# ══════════════════════════════════════════════════════════
+#
+#  geo_filter        : minimum geo proximity required before first relaxation
+#                      "city" | "province" | "region" | "none"
+#  geo_relaxes_after : seconds of wait until geo_filter relaxes to geo_relaxed_to
+#                      None = never relaxes
+#  geo_relaxed_to    : geo level after relaxation; "none" = no geo restriction
+#  min_quality       : minimum ML score for a pairing to be accepted
+#  wait_weight       : multiplier applied to wait_seconds before scoring
+#                      (0.0 = wait time ignored; 1.0 = full weight)
+#
+MATCH_MODE_CONFIG: dict = {
+    "quick": {
+        "min_quality":       0.45,
+        "geo_filter":        "province",
+        "geo_relaxes_after": 300,       # relax after 5 min
+        "geo_relaxed_to":    "region",
+        "wait_weight":       1.0,
+    },
+    "ranked": {
+        "min_quality":       0.65,      # stricter — protect rating integrity
+        "geo_filter":        "region",
+        "geo_relaxes_after": None,      # never relaxes for ranked
+        "geo_relaxed_to":    None,
+        "wait_weight":       0.5,       # wait time matters less than fairness
+    },
+    "friendly": {
+        "min_quality":       0.30,      # loose — casual play
+        "geo_filter":        "region",
+        "geo_relaxes_after": 180,       # relax after 3 min
+        "geo_relaxed_to":    "none",    # no geo restriction after relaxation
+        "wait_weight":       0.8,
+    },
+    "club": {
+        "min_quality":       0.40,
+        "geo_filter":        "none",    # players are already inside the same club
+        "geo_relaxes_after": None,
+        "geo_relaxed_to":    None,
+        "wait_weight":       0.6,
+    },
+    "tournament": {
+        "min_quality":       0.50,
+        "geo_filter":        "none",    # same event — location irrelevant
+        "geo_relaxes_after": None,
+        "geo_relaxed_to":    None,
+        "wait_weight":       0.0,       # wait time is meaningless for seeding
+    },
+    "booked": {
+        "min_quality":       0.40,
+        "geo_filter":        "region",
+        "geo_relaxes_after": None,      # scheduled match — no pressure to relax
+        "geo_relaxed_to":    None,
+        "wait_weight":       0.0,       # no live wait time for a planned match
+    },
+}
+
+# Maps geo level names to the minimum score produced by compute_geo_score()
+_GEO_LEVEL_MIN: dict = {
+    "city":     1.0,
+    "province": 0.7,
+    "region":   0.4,
+    "none":     0.0,   # accept anything
+}
+
 _model      = None
 _sport_enc  = None
 _format_enc = None
@@ -148,6 +216,7 @@ def find_best_opponent(
     match_format: str,
     wait_seconds: int = 0,
     min_score: float = 0.45,
+    mode: str = "quick",
 ) -> Optional[dict]:
     """
     1v1: Find the best opponent from a list of queue candidates.
@@ -157,39 +226,52 @@ def find_best_opponent(
         current_streak, city_code, province_code, region_code,
         player_id, h2h_count (optional), queue_wait_seconds (optional)
 
+    mode controls geo filtering, quality threshold, and wait weighting.
+    Supported modes: quick | ranked | friendly | club | tournament | booked
+
     Returns best candidate dict (with _ml_score attached), or None.
     """
     if not candidates:
         return None
+
+    cfg         = MATCH_MODE_CONFIG.get(mode, MATCH_MODE_CONFIG["quick"])
+    base_min    = min_score if min_score != 0.45 else cfg["min_quality"]
+    wait_weight = float(cfg["wait_weight"])
 
     best_candidate, best_score = None, -1.0
 
     for candidate in candidates:
         try:
             effective_wait = max(wait_seconds, int(candidate.get("queue_wait_seconds", 60)))
+            weighted_wait  = int(effective_wait * wait_weight)
 
-            # ── Hard geo pre-filter (staged expansion) ────────────────────────
-            # Prevent cross-region matches regardless of how good the ML score is.
-            # Minimum required geo score relaxes the longer both players wait:
-            #   < 5 min  → same province required  (geo >= 0.7)
-            #   5-10 min → same region required     (geo >= 0.4)
-            #   10+ min  → same region still        (geo >= 0.4, never cross-region)
-            geo = compute_geo_score(
-                player.get("city_code"),     candidate.get("city_code"),
-                player.get("province_code"), candidate.get("province_code"),
-                player.get("region_code"),   candidate.get("region_code"),
-            )
-            if effective_wait < 300:
-                min_geo = 0.7   # same province
+            # ── Mode-aware geo pre-filter ──────────────────────────────────────
+            geo_filter   = cfg["geo_filter"]
+            relax_after  = cfg["geo_relaxes_after"]
+            relaxed_to   = cfg.get("geo_relaxed_to")
+
+            # Determine which geo level applies right now
+            if geo_filter == "none":
+                min_geo = 0.0   # no geo restriction
             else:
-                min_geo = 0.4   # same region
+                base_min_geo = _GEO_LEVEL_MIN.get(geo_filter, 0.4)
+                if relax_after is not None and effective_wait >= relax_after and relaxed_to:
+                    min_geo = _GEO_LEVEL_MIN.get(relaxed_to, 0.0)
+                else:
+                    min_geo = base_min_geo
 
-            if geo < min_geo:
-                logger.debug(
-                    f"[1v1] Skipping candidate {candidate.get('player_id')}: "
-                    f"geo={geo:.1f} < required {min_geo:.1f} (wait={effective_wait}s)"
+            if min_geo > 0.0:
+                geo = compute_geo_score(
+                    player.get("city_code"),     candidate.get("city_code"),
+                    player.get("province_code"), candidate.get("province_code"),
+                    player.get("region_code"),   candidate.get("region_code"),
                 )
-                continue
+                if geo < min_geo:
+                    logger.debug(
+                        f"[1v1/{mode}] Skipping {candidate.get('player_id')}: "
+                        f"geo={geo:.1f} < required {min_geo:.1f} (wait={effective_wait}s)"
+                    )
+                    continue
             # ──────────────────────────────────────────────────────────────────
 
             score = score_candidate(
@@ -213,7 +295,7 @@ def find_best_opponent(
 
                 sport        = sport,
                 match_format = match_format,
-                wait_seconds = effective_wait,
+                wait_seconds = weighted_wait,
                 h2h_count    = int(candidate.get("h2h_count", 0)),
             )
 
@@ -226,15 +308,19 @@ def find_best_opponent(
             logger.warning(f"Error scoring candidate {candidate.get('player_id')}: {e}")
             continue
 
-    # Threshold relaxes the longer players wait
-    wait_bonus    = min(wait_seconds / 600.0, 0.15)
-    effective_min = max(min_score - wait_bonus, 0.25)
+    # For quick/friendly modes: threshold relaxes slightly the longer players wait.
+    # For ranked mode: threshold never drops below a hard floor.
+    if mode == "ranked":
+        effective_min = base_min   # no relaxation for ranked
+    else:
+        wait_bonus    = min(wait_seconds / 600.0, 0.15)
+        effective_min = max(base_min - wait_bonus, 0.20)
 
     if best_score >= effective_min:
-        logger.info(f"[1v1] Match found: score={best_score:.3f} threshold={effective_min:.3f}")
+        logger.info(f"[1v1/{mode}] Match found: score={best_score:.3f} threshold={effective_min:.3f}")
         return best_candidate
 
-    logger.info(f"[1v1] No match. Best={best_score:.3f} < threshold={effective_min:.3f}")
+    logger.info(f"[1v1/{mode}] No match. Best={best_score:.3f} < threshold={effective_min:.3f}")
     return None
 
 

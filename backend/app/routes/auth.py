@@ -11,7 +11,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.middleware.auth import get_current_user
 from app.models.models import Profile, SecurityAuditLog, UserRoleModel
 
@@ -118,7 +118,12 @@ def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception as exc:
+        # Prevent malformed/legacy hashes from crashing login with HTTP 500.
+        logger.warning(f"[auth] Password verification failed due to invalid hash format: {exc}")
+        return False
 
 def create_access_token(user_id: str, email: str, token_version: int) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes)
@@ -137,13 +142,20 @@ def _get_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 def _log_audit(db: Session, user_id: str, event_type: str, ip: str, details: dict) -> None:
-    entry = SecurityAuditLog(
-        user_id=user_id,
-        event_type=event_type,
-        ip_address=ip,
-        details=details,
-    )
-    db.add(entry)
+    # Best-effort logging in an isolated session so auth flows never fail
+    # if audit logging infrastructure is unavailable/misaligned.
+    try:
+        with SessionLocal() as audit_db:
+            entry = SecurityAuditLog(
+                user_id=user_id,
+                event_type=event_type,
+                ip_address=ip,
+                details=details,
+            )
+            audit_db.add(entry)
+            audit_db.commit()
+    except Exception as exc:
+        logger.warning(f"[auth] Failed to write security audit log ({event_type}) for {user_id}: {exc}")
 
 # ── Routes ────────────────────────────────────────────────
 
@@ -194,7 +206,7 @@ def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
         )
 
     roles = db.query(UserRoleModel).filter(UserRoleModel.user_id == str(profile.id)).all()
-    role_list = [r.role.value for r in roles]
+    role_list = [r.role.value if hasattr(r.role, "value") else str(r.role) for r in roles]
 
     current_version = int(getattr(profile, "token_version", 0) or 0)
     ip = _get_ip(request)
@@ -326,6 +338,63 @@ async def session_event_stream(token: str, db: Session = Depends(get_db)):
         finally:
             try:
                 await pubsub.unsubscribe(_kick_channel(user_id))
+                await pubsub.aclose()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/notifications/stream")
+async def notification_event_stream(token: str, db: Session = Depends(get_db)):
+    """
+    SSE endpoint — streams a 'new_notification' event whenever a notification
+    is created for the authenticated user.  Token passed as query param because
+    EventSource cannot set custom headers.
+    """
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        user_id: str | None = payload.get("sub")
+        token_version: int = int(payload.get("tv", -1))
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        profile = db.query(Profile).filter(Profile.id == user_id).first()
+        if not profile or int(getattr(profile, "token_version", -1)) != token_version:
+            raise HTTPException(status_code=401, detail="Session expired")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    finally:
+        db.close()
+
+    if _aredis is None:
+        async def _empty():
+            yield ": redis-unavailable\n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream")
+
+    redis_client = _aredis
+    _NOTIF_PREFIX = "isms:notif:"
+
+    async def _event_generator():
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(f"{_NOTIF_PREFIX}{user_id}")
+        ping_ticks = 0
+        try:
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg and msg.get("data") == "new":
+                    yield 'data: {"event":"new_notification"}\n\n'
+                ping_ticks += 1
+                if ping_ticks % 30 == 0:
+                    yield ": ping\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+        finally:
+            try:
+                await pubsub.unsubscribe(f"{_NOTIF_PREFIX}{user_id}")
                 await pubsub.aclose()
             except Exception:
                 pass

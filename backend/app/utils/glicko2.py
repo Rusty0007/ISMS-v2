@@ -7,7 +7,10 @@ def _g(phi: float) -> float:
     return 1.0 / math.sqrt(1 + 3 * phi**2 / math.pi**2)
 
 def _E(mu: float, mu_j: float, phi_j: float) -> float:
-    return 1.0 / (1 + math.exp(-_g(phi_j) * (mu - mu_j)))
+    exponent = -_g(phi_j) * (mu - mu_j)
+    exponent = max(-700.0, min(700.0, exponent))  # clamp to prevent math.exp overflow
+    e = 1.0 / (1 + math.exp(exponent))
+    return max(1e-8, min(1 - 1e-8, e))            # keep away from 0/1 to avoid ZeroDivision
 
 def update(
         rating: float,
