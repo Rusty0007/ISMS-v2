@@ -210,6 +210,15 @@ def _safe_win_rate(rating: PlayerRating | None, default: float = 0.5) -> float:
         return default
     return float(int(rating.wins or 0)) / float(int(rating.matches_played or 1))  # type: ignore[arg-type]
 
+
+def _resolve_match_mode(match: Match) -> str:
+    match_type_val = match.match_type.value if hasattr(match.match_type, "value") else str(match.match_type)
+    if match_type_val == "ranked":
+        return "ranked"
+    if getattr(match, "club_id", None) is not None:
+        return "club"
+    return "quick"
+
 # ── Request models ───────────────────────────────────────────────────────────
 
 class CreateFriendlyRequest(BaseModel):
@@ -385,11 +394,13 @@ def join_queue(
         raise HTTPException(400, "Invalid match format.")
 
     user_id = current_user["id"]
+    requested_mode = data.match_mode if data.match_mode in ("quick", "ranked", "club") else "quick"
+    requested_db_match_type = "ranked" if requested_mode == "ranked" else "queue"
 
     # Already in queue?
     if data.match_format == "singles":
         existing = db.query(Match).filter(
-            Match.match_type == "queue",
+            Match.match_type == requested_db_match_type,
             Match.sport == data.sport,
             Match.match_format == data.match_format,
             Match.player1_id == user_id,
@@ -484,7 +495,7 @@ def join_queue(
         preferred_club_id = club_uuid
 
     # ── Validate match_mode ────────────────────────────────────────────────────
-    match_mode = data.match_mode if data.match_mode in ("quick", "ranked", "club") else "quick"
+    match_mode = requested_mode
     # club mode requires a preferred_club_id
     if match_mode == "club" and not preferred_club_id:
         raise HTTPException(400, "match_mode='club' requires preferred_club_id.")
@@ -784,7 +795,7 @@ def get_my_queue(
     user_id = current_user["id"]
 
     match = db.query(Match).filter(
-        Match.match_type == "queue",
+        Match.match_type.in_(["queue", "ranked"]),
         Match.status.in_(["pending", "assembling"]),
         Match.winner_id.is_(None),
         or_(
@@ -805,6 +816,7 @@ def get_my_queue(
         "in_queue":      True,
         "sport":         match.sport.value,
         "match_format":  match.match_format.value,
+        "match_mode":    _resolve_match_mode(match),
         "status":        match.status.value,   # "pending" | "assembling"
         "players_joined": players_joined,
         "queued_at":     match.created_at.isoformat() if match.created_at is not None else None,  # type: ignore[union-attr]
@@ -815,15 +827,17 @@ def get_my_queue(
 def get_queue_status(
     sport: str,
     match_format: str = "singles",
+    match_mode: str = "quick",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     user_id = current_user["id"]
 
     if match_format == "singles":
+        singles_match_type = "ranked" if match_mode == "ranked" else "queue"
         # Include both player slots for live states so player2 can't accidentally requeue.
         match = db.query(Match).filter(
-            Match.match_type == "queue", Match.sport == sport,
+            Match.match_type == singles_match_type, Match.sport == sport,
             Match.match_format == match_format,
             Match.status.in_(["pending", "pending_approval", "ongoing"]),
             Match.winner_id.is_(None),
@@ -870,14 +884,16 @@ def get_queue_status(
 def leave_queue(
     sport: str,
     match_format: str = "singles",
+    match_mode: str = "quick",
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     user_id = current_user["id"]
 
     if match_format == "singles":
+        singles_match_type = "ranked" if match_mode == "ranked" else "queue"
         match = db.query(Match).filter(
-            Match.match_type == "queue", Match.player1_id == user_id,
+            Match.match_type == singles_match_type, Match.player1_id == user_id,
             Match.sport == sport, Match.match_format == match_format,
             Match.status == "pending", Match.player2_id.is_(None),
         ).first()
