@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     # --- Anthropic (LLM insights) ---
     anthropic_api_key: str = ""
 
+    # --- OpenRouter (preferred if configured for AI insights) ---
+    openrouter_api_key: str = ""
+    openrouter_model: str = "openai/gpt-4.1-mini"
+    openrouter_site_url: str = ""
+    openrouter_app_name: str = "ISMS"
+
     # --- Firebase Cloud Messaging ---
     firebase_credentials_path: str = "firebase-credentials.json"
 
