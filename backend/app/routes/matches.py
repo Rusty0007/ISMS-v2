@@ -21,6 +21,7 @@ from app.utils.glicko2 import update as glicko_update
 from app.config import settings
 from app.services.training_data_collector import save_training_row
 from app.services.matchmaking import find_best_opponent, get_model_info, score_candidate, run_matchmaking
+from app.services.match_lobby import ensure_match_lobby_rows
 from app.services.broadcast import broadcast_match as _broadcast
 from app.services.notifications import send_notification
 
@@ -396,6 +397,20 @@ def join_queue(
     user_id = current_user["id"]
     requested_mode = data.match_mode if data.match_mode in ("quick", "ranked", "club") else "quick"
     requested_db_match_type = "ranked" if requested_mode == "ranked" else "queue"
+    format_label = data.match_format.replace("_", " ")
+
+    ranked_rating_row = None
+    if requested_mode == "ranked":
+        ranked_rating_row = db.query(PlayerRating).filter(
+            PlayerRating.user_id == user_id,
+            PlayerRating.sport == data.sport,
+            PlayerRating.match_format == data.match_format,
+        ).first()
+        if not ranked_rating_row or str(ranked_rating_row.rating_status) != "RATED":
+            raise HTTPException(
+                400,
+                f"You must complete calibration (10 {format_label} matches) before joining the ranked queue.",
+            )
 
     # Already in queue?
     if data.match_format == "singles":
@@ -409,7 +424,7 @@ def join_queue(
         ).first()
     else:
         existing = db.query(Match).filter(
-            Match.match_type == "queue",
+            Match.match_type == requested_db_match_type,
             Match.sport == data.sport,
             Match.match_format == data.match_format,
             Match.status.in_(["assembling", "pending"]),
@@ -466,7 +481,7 @@ def join_queue(
         Match.match_type.in_(["queue", "ranked"]),
         Match.sport == data.sport,
         Match.match_format == data.match_format,
-        Match.status.in_(["ongoing", "pending_approval"]),
+        Match.status.in_(["awaiting_players", "ongoing", "pending_approval"]),
         Match.winner_id.is_(None),
         or_(
             Match.player1_id == user_id, Match.player2_id == user_id,
@@ -479,6 +494,7 @@ def join_queue(
             "status": "matched",
             "message": "You already have an active match for this queue.",
             "match_id": str(active_live.id),
+            "match_status": status_val,
             "pending_approval": status_val == "pending_approval",
         }
 
@@ -502,17 +518,12 @@ def join_queue(
 
     # ── Singles ───────────────────────────────────────────────────────────────
     if data.match_format == "singles":
-        my_rating  = db.query(PlayerRating).filter(
+        my_rating  = ranked_rating_row or db.query(PlayerRating).filter(
             PlayerRating.user_id == user_id,
             PlayerRating.sport == data.sport,
             PlayerRating.match_format == data.match_format,
         ).first()
         my_profile = db.query(Profile).filter(Profile.id == user_id).first()
-
-        # Ranked mode: only RATED players may enter the ranked queue
-        if match_mode == "ranked":
-            if not my_rating or str(my_rating.rating_status) != "RATED":
-                raise HTTPException(400, "You must complete calibration (10 matches) before joining the ranked queue.")
 
         # Resolve play location: explicit override → fall back to profile
         resolved_city     = data.play_city_code     or (my_profile.city_mun_code  if my_profile else None)
@@ -634,10 +645,12 @@ def join_queue(
                 if my_profile is not None and my_boost:
                     setattr(my_profile, "referee_boost_until", None)
                 db.commit()
+                found_status = found.status.value if hasattr(found.status, "value") else str(found.status)
                 return {
                     "status": "matched",
                     "message": "Opponent found! Awaiting club confirmation." if needs_approval else "Opponent found!",
                     "match_id": str(found.id),
+                    "match_status": found_status,
                     "ml_score": best.get("_ml_score"),
                     "court_assigned": bool(found.court_id),
                     "pending_approval": needs_approval,
@@ -660,7 +673,7 @@ def join_queue(
 
     # ── Doubles ───────────────────────────────────────────────────────────────
     assembling = db.query(Match).filter(
-        Match.match_type == "queue",
+        Match.match_type == requested_db_match_type,
         Match.sport == data.sport,
         Match.match_format == data.match_format,
         Match.status == "assembling",
@@ -724,10 +737,7 @@ def join_queue(
                 setattr(candidate, "team2_player1", team_b[0]["player_id"])
                 setattr(candidate, "team2_player2", team_b[1]["player_id"])
                 
-                setattr(candidate, "status", "ongoing")
-                setattr(candidate, "started_at", datetime.now(timezone.utc))
                 setattr(candidate, "ml_match_score", best_split["score"])  # save ML score
-                db.add(MatchSet(match_id=candidate.id, set_number=1, player1_score=0, player2_score=0))
                 
                 # Auto-assign court if club set
                 needs_approval = False
@@ -747,14 +757,23 @@ def join_queue(
                         club_obj = db.query(Club).filter(Club.id == avail.club_id).first()
                         if club_obj and str(club_obj.approval_mode) == "manual":
                             setattr(candidate, "status", "pending_approval")
+                            setattr(candidate, "started_at", datetime.now(timezone.utc))
+                            db.add(MatchSet(match_id=candidate.id, set_number=1, player1_score=0, player2_score=0))
                             needs_approval = True
                             _notify_duty_holders(db, avail.club_id, candidate.id, str(club_obj.name))
+
+                if not needs_approval:
+                    setattr(candidate, "status", "awaiting_players")
+                    setattr(candidate, "started_at", None)
+                    ensure_match_lobby_rows(db, candidate)
                 
                 db.commit()
+                candidate_status = candidate.status.value if hasattr(candidate.status, "value") else str(candidate.status)
                 return {
                     "status": "matched",
                     "message": "Balanced teams found! Awaiting club confirmation." if needs_approval else "Balanced teams found!",
                     "match_id": str(candidate.id),
+                    "match_status": candidate_status,
                     "players_joined": 4,
                     "pending_approval": needs_approval,
                     "split_score": best_split["score"],
@@ -776,7 +795,7 @@ def join_queue(
 
     # No suitable assembling match found — create a new one
     new_match = Match(
-        sport=data.sport, match_type="queue",
+        sport=data.sport, match_type=requested_db_match_type,
         match_format=data.match_format, status="assembling",
         player1_id=user_id,
         club_id=preferred_club_id,
@@ -805,7 +824,30 @@ def get_my_queue(
     ).order_by(Match.created_at.desc()).first()
 
     if not match:
-        return {"in_queue": False}
+        active_match = db.query(Match).filter(
+            Match.match_type.in_(["queue", "ranked"]),
+            Match.status.in_(["awaiting_players", "ongoing", "pending_approval"]),
+            Match.winner_id.is_(None),
+            or_(
+                Match.player1_id == user_id, Match.player2_id == user_id,
+                Match.player3_id == user_id, Match.player4_id == user_id,
+            ),
+        ).order_by(Match.created_at.desc()).first()
+
+        if not active_match:
+            return {"in_queue": False}
+
+        linked_party = db.query(Party.id).filter(Party.match_id == active_match.id).first()
+        return {
+            "in_queue": False,
+            "active_match": True,
+            "match_id": str(active_match.id),
+            "match_status": active_match.status.value,
+            "sport": active_match.sport.value,
+            "match_format": active_match.match_format.value,
+            "match_mode": _resolve_match_mode(active_match),
+            "return_route": "/matches/party" if linked_party else "/matches/queue",
+        }
 
     players_joined = sum(
         1 for pid in [match.player1_id, match.player2_id, match.player3_id, match.player4_id]
@@ -852,15 +894,20 @@ def get_queue_status(
         if status_val == "invalidated":
             return {"status": "not_in_queue"}
         if status_val in ("ongoing", "pending_approval") or match.player2_id is not None:
-            return {"status": "matched", "match_id": str(match.id),
-                    "pending_approval": status_val == "pending_approval"}
+            return {
+                "status": "matched",
+                "match_id": str(match.id),
+                "match_status": status_val,
+                "pending_approval": status_val == "pending_approval",
+            }
         return {"status": "waiting", "match_id": str(match.id)}
 
+    doubles_match_type = "ranked" if match_mode == "ranked" else "queue"
     # Doubles — include "ongoing" / "pending_approval" so players get notified
     match = db.query(Match).filter(
-        Match.match_type == "queue", Match.sport == sport,
+        Match.match_type == doubles_match_type, Match.sport == sport,
         Match.match_format == match_format,
-        Match.status.in_(["assembling", "pending", "pending_approval", "ongoing"]),
+        Match.status.in_(["assembling", "pending", "awaiting_players", "pending_approval", "ongoing"]),
         Match.status != "invalidated",
         or_(
             Match.player1_id == user_id, Match.player2_id == user_id,
@@ -872,9 +919,13 @@ def get_queue_status(
     if not match:
         return {"status": "not_in_queue"}
 
-    if match.status.value in ("ongoing", "pending_approval"):
-        return {"status": "matched", "match_id": str(match.id),
-                "pending_approval": match.status.value == "pending_approval"}
+    if match.status.value in ("awaiting_players", "ongoing", "pending_approval"):
+        return {
+            "status": "matched",
+            "match_id": str(match.id),
+            "match_status": match.status.value,
+            "pending_approval": match.status.value == "pending_approval",
+        }
 
     players_joined = sum(1 for pid in [match.player1_id, match.player2_id, match.player3_id, match.player4_id] if pid is not None)
     return {"status": "assembling", "match_id": str(match.id), "players_joined": players_joined}
@@ -902,8 +953,9 @@ def leave_queue(
             db.commit()
         return {"message": "Left queue."}
 
+    doubles_match_type = "ranked" if match_mode == "ranked" else "queue"
     match = db.query(Match).filter(
-        Match.match_type == "queue", Match.sport == sport,
+        Match.match_type == doubles_match_type, Match.sport == sport,
         Match.match_format == match_format, Match.status == "assembling",
         or_(
             Match.player1_id == user_id, Match.player2_id == user_id,

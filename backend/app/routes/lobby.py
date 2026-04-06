@@ -8,6 +8,7 @@ from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.models import Match, MatchLobbyPlayer, Profile, Party, MatchHistory
 from app.services.broadcast import broadcast_match
+from app.services.match_lobby import ensure_initial_match_set, ensure_match_lobby_rows
 from app.services.notifications import send_bulk_notifications
 
 router = APIRouter()
@@ -40,6 +41,11 @@ def get_lobby(
     if not match:
         raise HTTPException(404, "Match not found")
 
+    match_status = match.status.value if hasattr(match.status, "value") else str(match.status)
+    if match_status in ("awaiting_players", "ongoing"):
+        ensure_match_lobby_rows(db, match)
+        db.flush()
+
     rows = (
         db.query(MatchLobbyPlayer)
         .filter(MatchLobbyPlayer.match_id == match_id)
@@ -63,16 +69,18 @@ def get_lobby(
             players_by_user[uid] = incoming
 
     players = sorted(players_by_user.values(), key=lambda p: (p["team_no"], p["username"] or ""))
-    _, _, all_entered = _aggregate_lobby_status(rows)
-
-    match_status = match.status.value if hasattr(match.status, "value") else str(match.status)
+    entered_count, total, all_entered = _aggregate_lobby_status(rows)
+    linked_party = db.query(Party.id).filter(Party.match_id == match.id).first()
     return {
         "match_id":     match_id,
         "match_status": match_status,
         "sport":        match.sport.value if hasattr(match.sport, "value") else str(match.sport),
         "match_format": match.match_format.value if hasattr(match.match_format, "value") else str(match.match_format),
         "players":      players,
+        "entered_count": entered_count,
+        "total_players": total,
         "all_entered":  all_entered,
+        "return_route": "/matches/party" if linked_party else "/matches/queue",
     }
 
 
@@ -92,6 +100,9 @@ def enter_lobby(
     match_status = match.status.value if hasattr(match.status, "value") else str(match.status)
     if match_status not in ("awaiting_players", "ongoing"):
         raise HTTPException(400, f"Match is not in lobby state (status: {match_status})")
+
+    ensure_match_lobby_rows(db, match)
+    db.flush()
 
     # Mark this player's lobby rows as entered (idempotent, duplicate-safe).
     my_rows = db.query(MatchLobbyPlayer).filter(
@@ -115,6 +126,7 @@ def enter_lobby(
     if all_entered and match_status == "awaiting_players":
         setattr(match, "status", "ongoing")
         setattr(match, "started_at", now)
+        ensure_initial_match_set(db, match)
         db.commit()
         broadcast_match(match_id, {"type": "match_live", "match_id": match_id})
         return {"status": "match_started", "match_id": match_id}
@@ -153,6 +165,8 @@ def cancel_lobby(
         raise HTTPException(400, "Lobby is no longer cancellable")
 
     # Verify caller is in this lobby
+    ensure_match_lobby_rows(db, match)
+    db.flush()
     rows = db.query(MatchLobbyPlayer).filter(MatchLobbyPlayer.match_id == match_id).all()
     player_ids = [str(r.user_id) for r in rows]
     if user_id not in player_ids:
@@ -167,6 +181,7 @@ def cancel_lobby(
     for party in parties:
         setattr(party, "status", "ready")
         setattr(party, "match_id", None)
+        setattr(party, "queue_started_at", None)
 
     db.commit()
 
