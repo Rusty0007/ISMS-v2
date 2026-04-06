@@ -1950,6 +1950,9 @@ def record_point(
             set_winner = "team1" if t1 > t2 else "team2"
 
         if set_winner:
+            setattr(match_set, "is_completed", True)
+            setattr(match_set, "completed_at", datetime.now(timezone.utc))
+
             # Count sets won from all completed sets
             all_sets_now = db.query(MatchSet).filter(MatchSet.match_id == match_id).order_by(MatchSet.set_number).all()
             sets_to_win  = ruleset.get("sets_to_win", 2)
@@ -1973,11 +1976,27 @@ def record_point(
             else:
                 # Auto-create next set
                 next_set = data.set_number + 1
-                db.add(MatchSet(
-                    match_id=match_id, set_number=next_set,
-                    player1_score=0, player2_score=0,
-                    team1_score=0, team2_score=0,
-                ))
+                existing_next_set = db.query(MatchSet).filter(
+                    MatchSet.match_id == match_id,
+                    MatchSet.set_number == next_set,
+                ).first()
+                if existing_next_set:
+                    next_set_has_scoring = db.query(MatchHistory.id).filter(
+                        MatchHistory.match_id == match_id,
+                        MatchHistory.set_number == next_set,
+                        MatchHistory.event_type.in_(["point", "violation"]),
+                    ).first() is not None
+                    if not next_set_has_scoring:
+                        setattr(existing_next_set, "player1_score", 0)
+                        setattr(existing_next_set, "player2_score", 0)
+                        setattr(existing_next_set, "team1_score", 0)
+                        setattr(existing_next_set, "team2_score", 0)
+                else:
+                    db.add(MatchSet(
+                        match_id=match_id, set_number=next_set,
+                        player1_score=0, player2_score=0,
+                        team1_score=0, team2_score=0,
+                    ))
                 db.commit()
 
     all_sets = db.query(MatchSet).filter(MatchSet.match_id == match_id).order_by(MatchSet.set_number).all()
@@ -2203,6 +2222,8 @@ def undo_last_point(
         else:
             new_s = max(0, int(match_set.team2_score or match_set.player2_score or 1) - 1)  # type: ignore[arg-type]
             setattr(match_set, "team2_score", new_s); setattr(match_set, "player2_score", new_s)
+        setattr(match_set, "is_completed", False)
+        setattr(match_set, "completed_at", None)
 
     db.add(MatchHistory(
         match_id=match_id, event_type="undo", recorded_by=user_id,

@@ -1,13 +1,26 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
-from app.database import get_db
-from app.middleware.auth import get_current_user
-from app.models.models import Friendship, Profile, ClubCheckin
-from app.services.notifications import send_notification
 from datetime import datetime, timezone, timedelta
 
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.middleware.auth import get_current_user
+from app.models.models import Friendship, Notification, Profile, ClubCheckin
+from app.services.notifications import send_notification
+
 router = APIRouter()
+
+_SESSION_PREFIX = "isms:session:"
+
+try:
+    import redis as _redis_sync
+
+    _presence_redis = _redis_sync.from_url(settings.redis_url, decode_responses=True)
+    _presence_redis.ping()
+except Exception:
+    _presence_redis = None
 
 
 def _friendship_user_ids(f: Friendship, current_id: str) -> str:
@@ -23,6 +36,15 @@ def _profile_summary(p: Profile) -> dict:
         "last_name":  p.last_name,
         "avatar_url": p.avatar_url,
     }
+
+
+def _is_user_online(user_id: str) -> bool:
+    if _presence_redis is None:
+        return False
+    try:
+        return bool(_presence_redis.exists(f"{_SESSION_PREFIX}{user_id}"))
+    except Exception:
+        return False
 
 
 # ── Send friend request ───────────────────────────────────────────────────────
@@ -86,11 +108,48 @@ def accept_friend_request(
         raise HTTPException(404, "Request not found.")
     if str(f.addressee_id) != user_id:
         raise HTTPException(403, "Not your request to accept.")
+
+    requester = db.query(Profile).filter(Profile.id == f.requester_id).first()
+    addressee = db.query(Profile).filter(Profile.id == user_id).first()
+    requester_name = requester.username if requester else "this player"
+    addressee_name = addressee.username if addressee else "your friend"
+
+    existing_notifs = db.query(Notification).filter(
+        Notification.user_id == user_id,
+        Notification.type == "friend_request",
+        Notification.data["reference_id"].astext == friendship_id,
+    ).all()
+
+    if str(f.status) == "accepted":
+        for notif in existing_notifs:
+            notif.type = "friend_request_accepted"
+            notif.title = "Friend Request Accepted"
+            notif.body = f"You are now friends with @{requester_name}."
+            notif.is_read = True
+        db.commit()
+        return {"message": "Already friends."}
+
     if str(f.status) != "pending":
         raise HTTPException(400, "Request is not pending.")
 
     setattr(f, "status", "accepted")
+
+    for notif in existing_notifs:
+        notif.type = "friend_request_accepted"
+        notif.title = "Friend Request Accepted"
+        notif.body = f"You are now friends with @{requester_name}."
+        notif.is_read = True
+
     db.commit()
+
+    send_notification(
+        user_id=str(f.requester_id),
+        title="Friend Request Accepted",
+        body=f"@{addressee_name} accepted your friend request.",
+        notif_type="friend_request_accepted",
+        reference_id=str(f.id),
+    )
+
     return {"message": "Friend request accepted."}
 
 
@@ -135,10 +194,14 @@ def get_friends(
             result.append({
                 "friendship_id": str(f.id),
                 "since":         str(f.created_at),
+                "is_online":     _is_user_online(other_id),
                 **_profile_summary(profile),
             })
 
-    return {"friends": result, "count": len(result)}
+    result.sort(key=lambda friend: (not friend["is_online"], friend["username"].lower()))
+    online_count = sum(1 for friend in result if friend["is_online"])
+
+    return {"friends": result, "count": len(result), "online_count": online_count}
 
 
 # ── Pending incoming requests ─────────────────────────────────────────────────
