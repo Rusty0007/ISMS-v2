@@ -35,7 +35,7 @@ class AdvanceRequest(BaseModel):
 def _member_dict(m: CourtRotationMember) -> dict:
     return {
         "id":             str(m.id),
-        "user_id":        str(m.user_id) if m.user_id else None,
+        "user_id":        str(m.user_id) if m.user_id is not None else None,
         "display_name":   m.display_name,
         "queue_position": m.queue_position,
         "games_played":   m.games_played,
@@ -45,13 +45,13 @@ def _member_dict(m: CourtRotationMember) -> dict:
 
 
 def _rotation_dict(r: CourtRotation) -> dict:
-    court_size = 2 if r.format == "singles" else 4
+    court_size = 2 if str(r.format) == "singles" else 4
     return {
         "id":         str(r.id),
         "sport":      r.sport,
         "format":     r.format,
-        "club_id":    str(r.club_id)  if r.club_id  else None,
-        "court_id":   str(r.court_id) if r.court_id else None,
+        "club_id":    str(r.club_id)  if r.club_id  is not None else None,
+        "court_id":   str(r.court_id) if r.court_id is not None else None,
         "created_by": str(r.created_by),
         "status":     r.status,
         "court_size": court_size,
@@ -127,7 +127,7 @@ def add_member(
     rotation = db.query(CourtRotation).filter(CourtRotation.id == rotation_id).first()
     if not rotation:
         raise HTTPException(404, "Rotation not found.")
-    if rotation.status != "active":
+    if str(rotation.status) != "active":
         raise HTTPException(400, "Rotation session has ended.")
 
     # If user_id provided, resolve display_name from profile
@@ -137,7 +137,7 @@ def add_member(
         profile = db.query(Profile).filter(Profile.id == user_id).first()
         if not profile:
             raise HTTPException(404, "Player not found.")
-        display_name = profile.username
+        display_name = f"{profile.first_name or ''} {profile.last_name or ''}".strip() or "Player"
 
     # Check duplicate user
     if user_id:
@@ -202,14 +202,14 @@ def advance_rotation(
         raise HTTPException(404, "Rotation not found.")
     if str(rotation.created_by) != current_user["id"]:
         raise HTTPException(403, "Only the session creator can advance the rotation.")
-    if rotation.status != "active":
+    if str(rotation.status) != "active":
         raise HTTPException(400, "Rotation session has ended.")
 
     members = list(rotation.members)  # already sorted by queue_position
     if len(members) < 2:
         raise HTTPException(400, "Need at least 2 players to advance.")
 
-    court_size = 2 if rotation.format == "singles" else 4
+    court_size = 2 if str(rotation.format) == "singles" else 4
     playing    = members[:court_size]
     waiting    = members[court_size:]
     playing_ids = {str(m.id) for m in playing}

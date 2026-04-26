@@ -51,7 +51,7 @@ def send_referee_invite(
         raise HTTPException(404, "Match not found.")
     if match.referee_id is not None:
         raise HTTPException(400, "This match already has a referee assigned.")
-    if match.status.value not in ("pending", "ongoing"):
+    if match.status.value not in ("pending", "pending_approval", "awaiting_players", "ongoing"):
         raise HTTPException(400, "Cannot assign a referee to this match.")
 
     # Prevent the same user being invited twice for the same match
@@ -78,7 +78,7 @@ def send_referee_invite(
     inviter = db.query(Profile).filter(Profile.id == invited_by).first()
     inviter_name = f"{inviter.first_name} {inviter.last_name}" if inviter else "A player"
     invitee = db.query(Profile).filter(Profile.id == data.invited_user).first()
-    invitee_username = str(invitee.username) if invitee else "someone"
+    invitee_name = f"{invitee.first_name or ''} {invitee.last_name or ''}".strip() if invitee else "someone"
 
     send_notification(
         user_id=data.invited_user,
@@ -95,13 +95,13 @@ def send_referee_invite(
 
     # Broadcast to all match participants so their consoles update in real-time
     broadcast_match(str(data.match_id), {
-        "type":              "referee_invite_sent",
-        "invite_id":         str(invite.id),
-        "invited_by":        invited_by,
-        "invited_by_name":   inviter_name,
-        "invited_user":      data.invited_user,
-        "invited_username":  invitee_username,
-        "expires_at":        expires_at.isoformat(),
+        "type":            "referee_invite_sent",
+        "invite_id":       str(invite.id),
+        "invited_by":      invited_by,
+        "invited_by_name": inviter_name,
+        "invited_user":    data.invited_user,
+        "invited_name":    invitee_name,
+        "expires_at":      expires_at.isoformat(),
     })
 
     return {
@@ -203,7 +203,7 @@ def respond_to_invite(
         broadcast_match(str(invite.match_id), {
             "type":              "referee_assigned",
             "referee_id":        user_id,
-            "referee_username":  str(responder.username) if responder else "",
+            "referee_name":      f"{responder.first_name or ''} {responder.last_name or ''}".strip() if responder else "",
             "invite_id":         str(invite.id),
             "cancelled_invites": cancelled_ids,
         })
@@ -229,9 +229,9 @@ def respond_to_invite(
         )
 
         broadcast_match(str(invite.match_id), {
-            "type":      "referee_invite_declined",
-            "invite_id": str(invite.id),
-            "declined_username": str(responder.username) if responder else "",
+            "type":         "referee_invite_declined",
+            "invite_id":    str(invite.id),
+            "declined_name": f"{responder.first_name or ''} {responder.last_name or ''}".strip() if responder else "",
         })
 
         return {"message": "Invite declined. The match organizer has been notified."}
@@ -286,11 +286,7 @@ def get_match_referee_invites(
         p = prof_map.get(uid)
         if not p:
             return uid[:8]
-        return f"{p.first_name} {p.last_name}".strip() or str(p.username)  # type: ignore[arg-type]
-
-    def _username(uid: str) -> str:
-        p = prof_map.get(uid)
-        return str(p.username) if p else uid[:8]
+        return f"{p.first_name or ''} {p.last_name or ''}".strip() or uid[:8]
 
     result = []
     for inv in invites:
@@ -300,13 +296,13 @@ def get_match_referee_invites(
             if now > inv.expires_at:  # type: ignore[operator]
                 status = "expired"
         result.append({
-            "invite_id":         str(inv.id),
-            "invited_by":        str(inv.invited_by),
-            "invited_by_name":   _name(str(inv.invited_by)),
-            "invited_user":      str(inv.invited_user),
-            "invited_username":  _username(str(inv.invited_user)),
-            "status":            status,
-            "expires_at":        inv.expires_at.isoformat() if inv.expires_at is not None else None,
+            "invite_id":       str(inv.id),
+            "invited_by":      str(inv.invited_by),
+            "invited_by_name": _name(str(inv.invited_by)),
+            "invited_user":    str(inv.invited_user),
+            "invited_name":    _name(str(inv.invited_user)),
+            "status":          status,
+            "expires_at":      inv.expires_at.isoformat() if inv.expires_at is not None else None,
         })
 
     return {"invites": result}
@@ -465,7 +461,7 @@ def get_my_referee_invites(
             continue
         name = ""
         if inviter:
-            name = f"{inviter.first_name or ''} {inviter.last_name or ''}".strip() or inviter.username or "A player"
+            name = f"{inviter.first_name or ''} {inviter.last_name or ''}".strip() or "A player"
         result.append({
             "id": str(inv.id),
             "match_id": str(inv.match_id),
@@ -474,7 +470,6 @@ def get_my_referee_invites(
             "match_type": match.match_type.value,
             "match_status": match.status.value,
             "invited_by_id": str(inv.invited_by),
-            "invited_by_username": inviter.username if inviter else None,
             "invited_by_name": name or "A player",
             "expires_at": inv.expires_at.isoformat() if inv.expires_at is not None else None,
             "created_at": str(inv.created_at),
@@ -494,15 +489,59 @@ def get_my_referee_matches(
         Match.referee_id == user_id
     ).order_by(Match.created_at.desc()).all()
 
-    def fmt(m):
+    from app.models.models import MatchLobbyPlayer, Tournament, Profile as ProfileModel
+    from sqlalchemy import text as sa_text
+
+    # Batch-load lobby rows for all pending/ongoing matches
+    pending_ids = [str(m.id) for m in matches if m.status.value in ("pending", "ongoing")]
+    lobby_rows: dict[str, list] = {mid: [] for mid in pending_ids}
+    if pending_ids:
+        rows = db.query(MatchLobbyPlayer).filter(
+            MatchLobbyPlayer.match_id.in_(pending_ids)
+        ).all()
+        for row in rows:
+            lobby_rows[str(row.match_id)].append(row)
+
+    def _lobby_status(m) -> dict:
+        rows = lobby_rows.get(str(m.id), [])
+        entered = {str(r.user_id) for r in rows if r.status == "entered"}
+        team1_ids = [str(m.player1_id)] if m.player1_id else []
+        team2_ids = [str(m.player2_id)] if m.player2_id else []
+        # doubles: include team players
+        if hasattr(m, "team1_player1") and m.team1_player1:
+            team1_ids = [str(m.team1_player1)]
+            if getattr(m, "team1_player2", None):
+                team1_ids.append(str(m.team1_player2))
+        if hasattr(m, "team2_player1") and m.team2_player1:
+            team2_ids = [str(m.team2_player1)]
+            if getattr(m, "team2_player2", None):
+                team2_ids.append(str(m.team2_player2))
+        team1_in  = bool(team1_ids) and all(pid in entered for pid in team1_ids)
+        team2_in  = bool(team2_ids) and all(pid in entered for pid in team2_ids)
+        ref_in    = str(user_id) in entered
+        all_ready = team1_in and team2_in and ref_in and bool(team1_ids) and bool(team2_ids)
         return {
-            "id": str(m.id), "sport": m.sport.value,
+            "team1_in_lobby": team1_in,
+            "team2_in_lobby": team2_in,
+            "ref_in_lobby":   ref_in,
+            "all_ready":      all_ready,
+        }
+
+    def fmt(m):
+        lobby = _lobby_status(m) if m.status.value in ("pending", "ongoing") else None
+        return {
+            "id":           str(m.id),
+            "sport":        m.sport.value,
             "match_format": m.match_format.value,
-            "match_type": m.match_type.value,
-            "status": m.status.value,
+            "match_type":   m.match_type.value,
+            "status":       m.status.value,
+            "tournament_id": str(m.tournament_id) if getattr(m, "tournament_id", None) else None,
+            "player1_id":   str(m.player1_id) if m.player1_id else None,
+            "player2_id":   str(m.player2_id) if m.player2_id else None,
             "scheduled_at": str(m.scheduled_at) if m.scheduled_at else None,
-            "started_at": str(m.started_at) if m.started_at else None,
+            "started_at":   str(m.started_at)   if m.started_at   else None,
             "completed_at": str(m.completed_at) if m.completed_at else None,
+            "lobby":        lobby,
         }
 
     return {
@@ -522,7 +561,7 @@ def referee_leave_match(
     db: Session = Depends(get_db),
 ):
     """
-    Called when the assigned referee voluntarily leaves a pending or ongoing match.
+    Called when the assigned referee voluntarily leaves a pre-live or ongoing match.
     The match is immediately invalidated and all players are notified.
     """
     user_id = current_user["id"]
@@ -532,8 +571,13 @@ def referee_leave_match(
         raise HTTPException(status_code=404, detail="Match not found.")
     if match.referee_id is None or str(match.referee_id) != user_id:
         raise HTTPException(status_code=403, detail="You are not the referee for this match.")
-    if match.status.value not in ("pending", "assembling", "ongoing"):
+    status_val = match.status.value if hasattr(match.status, "value") else str(match.status)
+    if status_val in ("cancelled", "completed", "invalidated"):
+        return {"message": "Match is already finished."}
+    if status_val not in ("pending", "assembling", "awaiting_players", "pending_approval", "ongoing"):
         raise HTTPException(status_code=400, detail="Match is not in an active state.")
+
+    phase = "live match" if status_val == "ongoing" else "lobby"
 
     # Invalidate the match
     setattr(match, "status", MatchStatus.invalidated)
@@ -560,8 +604,6 @@ def referee_leave_match(
 
     referee = db.query(Profile).filter(Profile.id == user_id).first()
     ref_name = f"{referee.first_name} {referee.last_name}".strip() if referee else "The referee"
-
-    phase = "live match" if match.status.value == "ongoing" else "lobby"
 
     if player_ids:
         send_bulk_notifications(

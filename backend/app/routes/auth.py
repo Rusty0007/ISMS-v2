@@ -94,7 +94,6 @@ def _clear_session(user_id: str) -> None:
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
-    username: str
     first_name: str
     last_name: str
 
@@ -106,10 +105,11 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user_id: str
-    username: str
+    first_name: str
+    last_name: str
     roles: list[str]
     profile_setup_complete: bool
-    # True when a previous session was found and replaced (old device will be kicked)
+    # Backward-compatible field kept for existing clients.
     session_replaced: bool = False
 
 # ── Helpers ───────────────────────────────────────────────
@@ -162,13 +162,6 @@ def _log_audit(db: Session, user_id: str, event_type: str, ip: str, details: dic
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
 
-    existing_username = db.query(Profile).filter(Profile.username == data.username).first()
-    if existing_username:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Username is already taken. Please choose another."
-        )
-
     existing_email = db.query(Profile).filter(Profile.email == data.email).first()
     if existing_email:
         raise HTTPException(
@@ -177,9 +170,9 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
         )
 
     user_id = str(uuid.uuid4())
+
     new_profile = Profile(
         id=user_id,
-        username=data.username,
         email=data.email,
         hashed_password=hash_password(data.password),
         first_name=data.first_name,
@@ -216,17 +209,20 @@ def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
     # If a session key exists in Redis, another device/tab still has this account open.
     # We kick the old session (real-time SSE push) and replace it with the new one.
     # The new login is NOT blocked — the user should never be locked out of their own account.
-    session_replaced = False
     if _has_active_session(user_id):
-        session_replaced = True
-        # Push a kick event so the old browser tab receives it immediately via SSE
+        setattr(profile, "token_version", current_version + 1)
         _publish_kick(user_id)
         _clear_session(user_id)
-        _log_audit(db, user_id, "SESSION_REPLACED", ip, {
+        _log_audit(db, user_id, "ALL_SESSIONS_TERMINATED", ip, {
             "email": str(profile.email),
-            "note": "Previous session was active; it has been terminated.",
+            "note": "Another active session was detected; all sessions were signed out.",
         })
-        logger.warning(f"[auth] SESSION_REPLACED for user {user_id} from {ip}")
+        db.commit()
+        logger.warning(f"[auth] ALL_SESSIONS_TERMINATED for user {user_id} from {ip}")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another active session was detected. For security, all sessions for this account were signed out. Please sign in again.",
+        )
 
     # ── Issue new token ────────────────────────────────────
     new_version = current_version + 1
@@ -234,8 +230,7 @@ def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
 
     _mark_session_active(user_id)
 
-    event = "LOGIN_SESSION_REPLACED" if session_replaced else "LOGIN"
-    _log_audit(db, user_id, event, ip, {"email": str(profile.email)})
+    _log_audit(db, user_id, "LOGIN", ip, {"email": str(profile.email)})
     db.commit()
 
     token = create_access_token(user_id, str(profile.email), new_version)
@@ -243,11 +238,31 @@ def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
     return LoginResponse(
         access_token=token,
         user_id=user_id,
-        username=str(profile.username),
+        first_name=str(profile.first_name or ""),
+        last_name=str(profile.last_name or ""),
         roles=role_list,
         profile_setup_complete=bool(profile.profile_setup_complete),
-        session_replaced=session_replaced,
     )
+
+
+@router.post("/refresh")
+def refresh_token(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Issue a new JWT with a fresh expiry without bumping token_version.
+    Call this proactively (e.g. when < 30 min remain) so long-running
+    sessions (matches, open play) never expire mid-activity.
+    """
+    user_id = current_user["id"]
+    profile = db.query(Profile).filter(Profile.id == user_id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found.")
+    token = create_access_token(
+        user_id, str(profile.email), int(getattr(profile, "token_version", 0) or 0)
+    )
+    return {"access_token": token, "token_type": "bearer"}
 
 
 @router.post("/logout")

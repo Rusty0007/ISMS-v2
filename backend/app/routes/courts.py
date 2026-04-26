@@ -194,7 +194,7 @@ def get_live_court_view(
     profile_map: dict = {}   # id → username
     if all_profile_ids:
         profiles = db.query(Profile).filter(Profile.id.in_(list(all_profile_ids))).all()
-        profile_map = {str(p.id): p.username for p in profiles}
+        profile_map = {str(p.id): f"{p.first_name or ''} {p.last_name or ''}".strip() for p in profiles}
 
     # Batch-fetch total matches_played per player (summed across all sports/formats)
     matches_played_map: dict = {}  # str(user_id) → int total
@@ -536,8 +536,8 @@ def get_court_availability(
     if not courts:
         return {"courts": []}
 
-    # Generate 1-hour slots 06:00–22:00
-    slot_hours = list(range(6, 22))  # 06:00 to 21:00 start times
+    # Generate 1-hour slots 06:00–23:00 (last slot ends at 11 PM)
+    slot_hours = list(range(6, 23))  # 06:00 to 22:00 start times
 
     result = []
     for court in courts:
@@ -681,6 +681,45 @@ def list_standalone_courts(
     return {"courts": [_serialize_standalone(c) for c in courts]}
 
 
+@router.get("/courts/my-bookings")
+def get_my_court_bookings(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["id"]
+    now_utc = datetime.now(timezone.utc)
+
+    bookings = (
+        db.query(CourtBooking, Court)
+        .join(Court, Court.id == CourtBooking.court_id)
+        .filter(
+            CourtBooking.requested_by == user_id,
+            CourtBooking.scheduled_at.isnot(None),
+            CourtBooking.scheduled_at >= now_utc,
+            CourtBooking.status.in_(["pending_approval", "approved"]),
+        )
+        .order_by(CourtBooking.scheduled_at.asc(), CourtBooking.created_at.desc())
+        .all()
+    )
+
+    return {
+        "bookings": [
+            {
+                "id": str(booking.id),
+                "court_id": str(court.id),
+                "court_name": court.name,
+                "sport": court.sport.value if getattr(court, "sport", None) is not None and hasattr(court.sport, "value") else court.sport,
+                "scheduled_at": booking.scheduled_at.isoformat() if booking.scheduled_at is not None else None,
+                "duration_hours": float(getattr(booking, "duration_hours", 1) or 1),
+                "status": booking.status,
+                "is_indoor": court.is_indoor,
+                "booking_type": getattr(booking, "booking_type", "rental") or "rental",
+            }
+            for booking, court in bookings
+        ]
+    }
+
+
 @router.put("/courts/{court_id}")
 def update_standalone_court(
     court_id: str,
@@ -728,8 +767,7 @@ def get_standalone_court(
     if creator:
         profile = db.query(Profile).filter(Profile.id == creator).first()
         if profile:
-            owner_name = (f"{profile.first_name} {profile.last_name}".strip()  # type: ignore[arg-type]
-                          or str(profile.username))
+            owner_name = f"{profile.first_name or ''} {profile.last_name or ''}".strip() or "Unknown"
 
     return _serialize_standalone(court, owner_name=owner_name)
 
@@ -762,7 +800,7 @@ def get_court_availability_standalone(
         CourtBooking.scheduled_at < day_end,
     ).all()
 
-    slot_hours = list(range(6, 22))
+    slot_hours = list(range(6, 23)) # 06:00 to 22:00 start times (ends at 11 PM)
     slots = []
     for hour in slot_hours:
         slot_start = datetime(target_date.year, target_date.month, target_date.day, hour, 0, 0, tzinfo=timezone.utc)
@@ -823,7 +861,7 @@ def get_court_bookings(
     # Batch-fetch requester names
     requester_ids = list({str(b.requested_by) for b in bookings if b.requested_by is not None})
     profiles = db.query(Profile).filter(Profile.id.in_(requester_ids)).all()
-    profile_map = {str(p.id): (f"{p.first_name} {p.last_name}".strip() or p.username) for p in profiles}
+    profile_map = {str(p.id): f"{p.first_name or ''} {p.last_name or ''}".strip() for p in profiles}
 
     return {"bookings": [
         {

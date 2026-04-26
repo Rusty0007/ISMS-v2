@@ -2,6 +2,37 @@ import math
 
 SCALE = 173.7178
 TAU = 0.5
+DEFAULT_VOLATILITY = 0.06
+MIN_VOLATILITY = 0.01
+MAX_VOLATILITY = 0.2
+MIN_RD = 10.0
+MAX_RD = 500.0
+RATING_FLOOR = 500.0
+RATING_CEILING = 2700.0
+CONVERGENCE_TOLERANCE = 1e-6
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _safe_rating(value: float) -> float:
+    if not math.isfinite(value):
+        return 1500.0
+    return _clamp(value, RATING_FLOOR, RATING_CEILING)
+
+
+def _safe_rd(value: float) -> float:
+    if not math.isfinite(value):
+        return 350.0
+    return _clamp(value, MIN_RD, MAX_RD)
+
+
+def _safe_volatility(value: float) -> float:
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_VOLATILITY
+    return _clamp(value, MIN_VOLATILITY, MAX_VOLATILITY)
+
 
 def _g(phi: float) -> float:
     return 1.0 / math.sqrt(1 + 3 * phi**2 / math.pi**2)
@@ -24,6 +55,13 @@ def update(
     Single-game Glicko-2 update.
     Returns (new_rating, new_rd, new_volatility) on the original 1500-scale.
     """
+    rating = _safe_rating(float(rating))
+    rd = _safe_rd(float(rd))
+    volatility = _safe_volatility(float(volatility))
+    opp_rating = _safe_rating(float(opp_rating))
+    opp_rd = _safe_rd(float(opp_rd))
+    score = _clamp(float(score), 0.0, 1.0)
+
     # Convert to Glicko-2 scale
     mu = (rating - 1500) / SCALE
     phi = rd / SCALE
@@ -40,7 +78,7 @@ def update(
     # Score-based improvement delta
     delta = v * g_j * (score - e_j)
 
-    # ── New volatility (Illinois algorithm) ──────────────────────────────────
+    # New volatility (Illinois algorithm)
     a = math.log(sigma**2)
 
     def f(x: float) -> float:
@@ -61,21 +99,24 @@ def update(
 
     fA, fB = f(A), f(B)
     for _ in range(100):
-        if abs(fB - fA) < 1e-10:
+        if abs(B - A) < CONVERGENCE_TOLERANCE:
             break
-        C = A + (A - B) * fA / (fB - fA)
+        denominator = fB - fA
+        if abs(denominator) < 1e-10:
+            break
+        C = A + (A - B) * fA / denominator
         fC = f(C)
         if fC * fB < 0:
             A, fA = B, fB
         else:
             fA /= 2
-            B, fB = C, fC
-            if abs(B - A) < 1e-6:
-                break
+        B, fB = C, fC
+        if abs(B - A) < CONVERGENCE_TOLERANCE:
+            break
 
-    sigma_prime = math.exp(A / 2)
+    sigma_prime = _safe_volatility(math.exp(A / 2))
 
-    # ── New RD and rating ────────────────────────────────────────────────────
+    # New RD and rating
     phi_star = math.sqrt(phi**2 + sigma_prime**2)
     phi_prime = 1.0 / math.sqrt(1.0 / phi_star**2 + 1.0 / v)
     mu_prime = mu + phi_prime**2 * g_j * (score - e_j)
@@ -83,5 +124,10 @@ def update(
     # Convert back to original scale
     new_rating = mu_prime * SCALE + 1500
     new_rd = phi_prime * SCALE
+
+    # Guard: clamp to a realistic range.
+    # [500, 2700] covers Beginner to Elite with headroom; prevents cascade divergence.
+    new_rating = _safe_rating(new_rating)
+    new_rd     = _safe_rd(new_rd)
 
     return round(new_rating, 2), round(new_rd, 2), round(sigma_prime, 6)

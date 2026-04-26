@@ -1,8 +1,9 @@
 import logging
-from typing import Optional
+from typing import Optional, cast
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models.models import Match, PlayerRating, Profile
+from app.utils.skill_tiers import get_skill_tier_slug
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +42,17 @@ def compute_geo_score(
 
 
 def get_skill_category(rating: float) -> str:
-    if rating < 1100:   return "beginner"
-    elif rating < 1500: return "intermediate"
-    elif rating < 1900: return "advanced"
-    else:               return "expert"
+    return get_skill_tier_slug(rating)
 
 
 def safe_win_rate(rating: PlayerRating | None, default: float = 0.5) -> float:
-    if not rating or not rating.matches_played or rating.matches_played <= 0:
+    if rating is None:
         return default
-    return float(rating.wins / rating.matches_played)
+    mp: int = cast(int, rating.matches_played) or 0
+    if mp <= 0:
+        return default
+    wins: int = cast(int, rating.wins) or 0
+    return float(wins) / mp
 
 
 # ── Main Collector ────────────────────────────────────────

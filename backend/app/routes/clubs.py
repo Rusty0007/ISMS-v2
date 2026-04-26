@@ -256,7 +256,7 @@ def my_club_invites(
             "club_name":           club.name if club else None,
             "sport":               club.sport.value if club is not None and club.sport is not None else None,
             "category":            club.category if club else None,
-            "invited_by_username": inviter.username if inviter else None,
+            "invited_by_name": f"{inviter.first_name or ''} {inviter.last_name or ''}".strip() if inviter else None,
             "message":             inv.message,
             "expires_at":          str(inv.expires_at),
             "created_at":          str(inv.created_at),
@@ -307,10 +307,14 @@ def send_club_invite(
     db.commit()
     db.refresh(invite)
 
+    inviter_name = "Admin"
+    if inviter:
+        inviter_name = f"{inviter.first_name or ''} {inviter.last_name or ''}".strip() or "Admin"
+
     send_notification(
         user_id      = str(target_id),
         title        = "Club Invitation",
-        body         = f"@{inviter.username if inviter else 'Admin'} invited you to join {club.name}.",
+        body         = f"{inviter_name} invited you to join {club.name}.",
         notif_type   = "club_invite",
         reference_id = str(invite.id),
     )
@@ -354,18 +358,26 @@ def respond_club_invite(
             ClubMember.user_id == user_id,
         ).first():
             db.add(ClubMember(club_id=invite.club_id, user_id=user_id, role="member"))
+        invitee_name = "Someone"
+        if invitee:
+            invitee_name = f"{invitee.first_name or ''} {invitee.last_name or ''}".strip() or "Someone"
+        club_name = club.name if club else "your club"
         send_notification(
             user_id      = str(invite.invited_by),
             title        = "Invite Accepted",
-            body         = f"@{invitee.username if invitee else 'Someone'} joined {club.name if club else 'your club'}.",
+            body         = f"{invitee_name} joined {club_name}.",
             notif_type   = "club_invite_accepted",
             reference_id = str(invite.club_id),
         )
     else:
+        invitee_name = "Someone"
+        if invitee:
+            invitee_name = f"{invitee.first_name or ''} {invitee.last_name or ''}".strip() or "Someone"
+        club_name = club.name if club else "your club"
         send_notification(
             user_id      = str(invite.invited_by),
             title        = "Invite Declined",
-            body         = f"@{invitee.username if invitee else 'Someone'} declined your invite to {club.name if club else 'your club'}.",
+            body         = f"{invitee_name} declined your invite to {club_name}.",
             notif_type   = "club_invite_declined",
             reference_id = str(invite.club_id),
         )
@@ -416,7 +428,7 @@ def get_club(
         "approval_mode": club.approval_mode or "auto",
         "address": club.address,
         "admin_id": str(club.admin_id),
-        "admin_username": admin_profile.username if admin_profile else None,
+        "admin_name": f"{admin_profile.first_name or ''} {admin_profile.last_name or ''}".strip() if admin_profile else None,
         "region_code": club.region_code,
         "province_code": club.province_code,
         "city_mun_code": club.city_mun_code,
@@ -513,7 +525,6 @@ def list_members(
         result.append({
             "member_id": str(m.id),
             "user_id": str(m.user_id),
-            "username": profile.username if profile else None,
             "first_name": profile.first_name if profile else None,
             "last_name": profile.last_name if profile else None,
             "role": m.role or "member",
@@ -580,6 +591,22 @@ def club_stats(
     }
 
 
+@router.get("/{club_id}/courts")
+def club_courts(
+    club_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    club = _club_or_404(db, club_id)
+    courts = db.query(Court).filter(Court.club_id == club.id).all()
+    return {
+        "courts": [
+            {"id": str(c.id), "name": c.name, "sport": c.sport}
+            for c in courts
+        ]
+    }
+
+
 @router.get("/{club_id}/occupancy")
 def club_occupancy(
     club_id: str,
@@ -622,7 +649,7 @@ def club_occupancy(
     profile_map: dict = {}
     if all_lookup:
         for p in db.query(Profile).filter(Profile.id.in_(list(all_lookup))).all():
-            profile_map[str(p.id)] = p.username
+            profile_map[str(p.id)] = f"{p.first_name or ''} {p.last_name or ''}".strip()
 
     matches_played_map: dict = {}
     if all_pids:
@@ -658,7 +685,7 @@ def club_occupancy(
         court_details.append({
             "court_id":   str(c.id),
             "name":       c.name,
-            "sport":      c.sport.value if c.sport is not None else None,
+            "sport":      c.sport,
             "status":     c.status,
             "surface":    c.surface,
             "is_indoor":  c.is_indoor,
@@ -757,8 +784,8 @@ def list_pending_matches(
             "sport":       m.sport.value if m.sport is not None else None,
             "format":      m.match_format.value if m.match_format is not None else None,
             "court_name":  court.name if court else None,
-            "player1":     p1.username if p1 else None,
-            "player2":     p2.username if p2 else None,
+            "player1":     f"{p1.first_name or ''} {p1.last_name or ''}".strip() if p1 else None,
+            "player2":     f"{p2.first_name or ''} {p2.last_name or ''}".strip() if p2 else None,
             "created_at":  str(m.created_at),
         })
     return {"pending_matches": result}
@@ -874,7 +901,6 @@ def get_club_rankings(
     q = (
         db.query(
             Profile.id,
-            Profile.username,
             Profile.first_name,
             Profile.last_name,
             Profile.avatar_url,
@@ -885,6 +911,8 @@ def get_club_rankings(
             PlayerRating.wins,
             PlayerRating.losses,
             PlayerRating.rating_status,
+            PlayerRating.distinct_opponents_count,
+            PlayerRating.is_matchmaking_eligible,
             PlayerRating.is_leaderboard_eligible,
         )
         .join(ClubMember, ClubMember.user_id == Profile.id)
@@ -909,10 +937,9 @@ def get_club_rankings(
         "gender":       gender,
         "rankings": [
             {
-                "rank":                  idx + 1,
-                "id":                    str(r.id),
-                "username":              r.username,
-                "first_name":            r.first_name,
+                "rank":       idx + 1,
+                "id":         str(r.id),
+                "first_name": r.first_name,
                 "last_name":             r.last_name,
                 "avatar_url":            r.avatar_url,
                 "gender":                r.gender,
@@ -922,6 +949,8 @@ def get_club_rankings(
                 "wins":                  r.wins,
                 "losses":                r.losses,
                 "rating_status":         r.rating_status,
+                "distinct_opponents_count": r.distinct_opponents_count,
+                "is_matchmaking_eligible": bool(r.is_matchmaking_eligible),
                 "is_leaderboard_eligible": bool(r.is_leaderboard_eligible),
             }
             for idx, r in enumerate(rows)

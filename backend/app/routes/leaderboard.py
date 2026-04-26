@@ -4,24 +4,24 @@ from sqlalchemy import text
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.models import Profile
+from app.services.rating_policy import (
+    LEADERBOARD_MIN_DISTINCT_OPPONENTS,
+    LEADERBOARD_MIN_MATCHES,
+    LEADERBOARD_RD_THRESHOLD,
+    ML_MATCHMAKING_MIN_MATCHES,
+)
+from app.utils.skill_tiers import SKILL_TIER_DEFINITIONS
 
 router = APIRouter()
 
-TIER_ORDER = ["Beginner", "Intermediate", "Advanced", "Expert", "Elite"]
+TIER_ORDER = [tier.name for tier in SKILL_TIER_DEFINITIONS]
 
 # Canonical level names keyed by lowercase slug (for query param → DB lookup)
-_LEVEL_SLUGS = {
-    "barangay":       "Barangay",
-    "city":           "City/Municipal",
-    "city_municipal": "City/Municipal",
-    "provincial":     "Provincial",
-    "regional":       "Regional",
-    "national":       "National",
-}
+_LEVEL_SLUGS = {tier.slug: tier.name for tier in SKILL_TIER_DEFINITIONS}
 
 
 NATIONAL_MIN_RATING   = 1900  # Minimum rating to appear on National leaderboard
-NATIONAL_MIN_MATCHES  = 10    # Minimum all-time matches to appear on National leaderboard
+NATIONAL_MIN_MATCHES  = LEADERBOARD_MIN_MATCHES
 
 
 def _build_filters(sport: str, match_format: str, geo_level: str, profile: Profile | None):
@@ -30,9 +30,18 @@ def _build_filters(sport: str, match_format: str, geo_level: str, profile: Profi
     filters = [
         "sport::TEXT = :sport",
         "match_format::TEXT = :match_format",
-        "user_id IN (SELECT user_id FROM player_ratings WHERE sport::TEXT = :sport AND match_format::TEXT = :match_format AND is_leaderboard_eligible = TRUE)",
+        "is_leaderboard_eligible = TRUE",
+        "matches_played >= :leaderboard_min_matches",
+        "distinct_opponents_count >= :leaderboard_min_opponents",
+        "rating_deviation <= :leaderboard_rd_threshold",
     ]
-    params: dict = {"sport": sport, "match_format": match_format}
+    params: dict = {
+        "sport": sport,
+        "match_format": match_format,
+        "leaderboard_min_matches": LEADERBOARD_MIN_MATCHES,
+        "leaderboard_min_opponents": LEADERBOARD_MIN_DISTINCT_OPPONENTS,
+        "leaderboard_rd_threshold": LEADERBOARD_RD_THRESHOLD,
+    }
 
     if geo_level == "national":
         # National board is exclusive — requires minimum rating + match count
@@ -78,7 +87,7 @@ def get_leaderboard(
             user_id, username, first_name, last_name,
             region_code, province_code, city_mun_code,
             rating, rating_deviation, wins, losses, matches_played,
-            current_win_streak, win_rate_pct, skill_tier, activeness_score
+            distinct_opponents_count, current_win_streak, win_rate_pct, skill_tier, activeness_score
         FROM leaderboard_view
         WHERE {where}
         ORDER BY rating DESC, wins DESC
@@ -103,6 +112,7 @@ def get_leaderboard(
             "wins":             row["wins"] or 0,
             "losses":           row["losses"] or 0,
             "matches_played":   row["matches_played"] or 0,
+            "distinct_opponents_count": row["distinct_opponents_count"] or 0,
             "win_rate_pct":     round(float(row["win_rate_pct"]), 1) if row["win_rate_pct"] else 0.0,
             "current_win_streak": row["current_win_streak"] or 0,
             "skill_tier":       row["skill_tier"],
@@ -155,7 +165,7 @@ def get_leaderboard(
 def get_competitive_leaderboard(
     sport:        str = Query(...),
     match_format: str = Query("singles"),
-    level:        str = Query(...),     # barangay | city_municipal | provincial | regional | national
+    level:        str = Query(...),     # novice | advanced_beginner | competent | proficient | expert
     limit:        int = Query(50, le=100),
     offset:       int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user),
@@ -186,7 +196,6 @@ def get_competitive_leaderboard(
     rd_threshold = float(rd_threshold)
 
     user_id = current_user["id"]
-    profile = db.query(Profile).filter(Profile.id == user_id).first()
 
     # Rating range filter
     rating_clause = "lv.rating >= :min_r AND lv.rating_deviation <= :rd_threshold"
@@ -194,26 +203,14 @@ def get_competitive_leaderboard(
         "sport": sport, "match_format": match_format,
         "min_r": min_r, "min_matches": int(min_matches),
         "rd_threshold": rd_threshold,
+        "leaderboard_min_matches": LEADERBOARD_MIN_MATCHES,
+        "leaderboard_min_opponents": LEADERBOARD_MIN_DISTINCT_OPPONENTS,
         "limit": limit, "offset": offset,
     }
     if max_r is not None:
-        rating_clause += " AND lv.rating <= :max_r"
+        rating_clause += " AND lv.rating < :max_r"
         params["max_r"] = max_r
 
-    # Location filter: show only players from the same geo scope as the viewer
-    location_clause = ""
-    if level_name == "Barangay" and profile is not None and profile.barangay_code is not None:
-        location_clause = "AND lv.barangay_code = :barangay_code"
-        params["barangay_code"] = profile.barangay_code
-    elif level_name == "City/Municipal" and profile is not None and profile.city_mun_code is not None:
-        location_clause = "AND lv.city_mun_code = :city_mun_code"
-        params["city_mun_code"] = profile.city_mun_code
-    elif level_name == "Provincial" and profile is not None and profile.province_code is not None:
-        location_clause = "AND lv.province_code = :province_code"
-        params["province_code"] = profile.province_code
-    elif level_name == "Regional" and profile is not None and profile.region_code is not None:
-        location_clause = "AND lv.region_code = :region_code"
-        params["region_code"] = profile.region_code
     # National → no location filter
 
     rows = db.execute(text(f"""
@@ -238,9 +235,9 @@ def get_competitive_leaderboard(
         )
         SELECT
             ROW_NUMBER() OVER (ORDER BY lv.rating DESC, lv.wins DESC) AS rank,
-            lv.user_id, lv.username, lv.first_name, lv.last_name,
+            lv.user_id, lv.first_name, lv.last_name,
             lv.rating, lv.rating_deviation, lv.wins, lv.losses, lv.matches_played,
-            lv.win_rate_pct, lv.current_win_streak, lv.skill_tier,
+            lv.distinct_opponents_count, lv.win_rate_pct, lv.current_win_streak, lv.skill_tier,
             COALESCE(a.recent_count, 0) AS recent_matches
         FROM leaderboard_view lv
         LEFT JOIN activity a ON a.uid = lv.user_id
@@ -248,8 +245,9 @@ def get_competitive_leaderboard(
           AND lv.match_format::TEXT = :match_format
           AND {rating_clause}
           AND COALESCE(a.recent_count, 0) >= :min_matches
-          AND lv.user_id IN (SELECT user_id FROM player_ratings WHERE sport::TEXT = :sport AND match_format::TEXT = :match_format AND is_leaderboard_eligible = TRUE)
-          {location_clause}
+          AND lv.is_leaderboard_eligible = TRUE
+          AND lv.matches_played >= :leaderboard_min_matches
+          AND lv.distinct_opponents_count >= :leaderboard_min_opponents
         ORDER BY lv.rating DESC, lv.wins DESC
         LIMIT :limit OFFSET :offset
     """), params).mappings().all()
@@ -268,8 +266,9 @@ def get_competitive_leaderboard(
         SELECT COUNT(*) FROM leaderboard_view lv LEFT JOIN activity a ON a.uid=lv.user_id
         WHERE lv.sport::TEXT=:sport AND lv.match_format::TEXT=:match_format
           AND {rating_clause} AND COALESCE(a.recent_count,0) >= :min_matches
-          AND lv.user_id IN (SELECT user_id FROM player_ratings WHERE sport::TEXT=:sport AND match_format::TEXT=:match_format AND is_leaderboard_eligible=TRUE)
-          {location_clause}
+          AND lv.is_leaderboard_eligible=TRUE
+          AND lv.matches_played >= :leaderboard_min_matches
+          AND lv.distinct_opponents_count >= :leaderboard_min_opponents
     """), count_params).scalar() or 0
 
     result = []
@@ -278,7 +277,6 @@ def get_competitive_leaderboard(
         entry = {
             "rank":               int(row["rank"]),
             "user_id":            str(row["user_id"]),
-            "username":           row["username"],
             "first_name":         row["first_name"],
             "last_name":          row["last_name"],
             "rating":             round(float(row["rating"]), 1) if row["rating"] else 1500.0,
@@ -286,6 +284,7 @@ def get_competitive_leaderboard(
             "wins":               row["wins"] or 0,
             "losses":             row["losses"] or 0,
             "matches_played":     row["matches_played"] or 0,
+            "distinct_opponents_count": row["distinct_opponents_count"] or 0,
             "win_rate_pct":       round(float(row["win_rate_pct"]), 1) if row["win_rate_pct"] else 0.0,
             "current_win_streak": row["current_win_streak"] or 0,
             "skill_tier":         row["skill_tier"],
@@ -336,6 +335,8 @@ def get_my_competitive_level(
         SELECT sport::TEXT, match_format, rating, rating_deviation,
                COALESCE(rating_status, 'CALIBRATING') AS rating_status,
                COALESCE(calibration_matches_played, 0) AS calibration_matches_played,
+               COALESCE(distinct_opponents_count, 0) AS distinct_opponents_count,
+               COALESCE(is_matchmaking_eligible, FALSE) AS is_matchmaking_eligible,
                COALESCE(is_leaderboard_eligible, FALSE) AS is_leaderboard_eligible
         FROM player_ratings WHERE user_id = :uid
     """), {"uid": user_id}).mappings().all()
@@ -363,6 +364,8 @@ def get_my_competitive_level(
         rc              = recent_map.get((sport, fmt), 0)
         rating_status   = r["rating_status"]
         cal_played      = int(r["calibration_matches_played"])
+        distinct_opps   = int(r["distinct_opponents_count"])
+        ml_ready        = bool(r["is_matchmaking_eligible"])
         is_rated        = bool(r["is_leaderboard_eligible"])
         is_calibrating  = (rating_status == "CALIBRATING")
 
@@ -375,7 +378,7 @@ def get_my_competitive_level(
             if hi is None:
                 in_tier = rat >= lo
             else:
-                in_tier = lo <= rat <= hi
+                in_tier = lo <= rat < hi
             if in_tier:
                 meets_matches = rc >= tier["minimum_matches_required"]
                 meets_rd      = p_rd <= rd_thresh
@@ -419,10 +422,16 @@ def get_my_competitive_level(
             # Calibration
             "rating_status":              rating_status,
             "is_calibrating":             is_calibrating,
+            "is_matchmaking_eligible":    ml_ready,
             "is_leaderboard_eligible":    is_rated,
             "calibration_matches_played": cal_played,
-            "calibration_target":         10,
-            "calibration_remaining":      max(0, 10 - cal_played) if is_calibrating else 0,
+            "distinct_opponents_count":   distinct_opps,
+            "matchmaking_target":         ML_MATCHMAKING_MIN_MATCHES,
+            "matchmaking_remaining":      max(0, ML_MATCHMAKING_MIN_MATCHES - cal_played) if not ml_ready else 0,
+            "calibration_target":         LEADERBOARD_MIN_MATCHES,
+            "calibration_remaining":      max(0, LEADERBOARD_MIN_MATCHES - cal_played) if is_calibrating else 0,
+            "leaderboard_distinct_opponents_target": LEADERBOARD_MIN_DISTINCT_OPPONENTS,
+            "leaderboard_distinct_opponents_remaining": max(0, LEADERBOARD_MIN_DISTINCT_OPPONENTS - distinct_opps) if not is_rated else 0,
         })
 
     return {"competitive_levels": results}
@@ -454,12 +463,21 @@ def get_my_rankings(
                 matches_played, win_rate_pct, skill_tier, current_win_streak,
                 ROW_NUMBER() OVER (PARTITION BY sport, match_format ORDER BY rating DESC, wins DESC) AS rank
             FROM leaderboard_view
+            WHERE is_leaderboard_eligible = TRUE
+              AND matches_played >= :leaderboard_min_matches
+              AND distinct_opponents_count >= :leaderboard_min_opponents
+              AND rating_deviation <= :leaderboard_rd_threshold
         ) sub
         WHERE sub.user_id = :uid
         ORDER BY sub.sport, sub.match_format
     """)
 
-    rows = db.execute(sql, {"uid": user_id}).mappings().all()
+    rows = db.execute(sql, {
+        "uid": user_id,
+        "leaderboard_min_matches": LEADERBOARD_MIN_MATCHES,
+        "leaderboard_min_opponents": LEADERBOARD_MIN_DISTINCT_OPPONENTS,
+        "leaderboard_rd_threshold": LEADERBOARD_RD_THRESHOLD,
+    }).mappings().all()
 
     return {
         "rankings": [

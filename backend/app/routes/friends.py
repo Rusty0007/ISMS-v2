@@ -31,7 +31,6 @@ def _friendship_user_ids(f: Friendship, current_id: str) -> str:
 def _profile_summary(p: Profile) -> dict:
     return {
         "id":         str(p.id),
-        "username":   p.username,
         "first_name": p.first_name,
         "last_name":  p.last_name,
         "avatar_url": p.avatar_url,
@@ -82,11 +81,11 @@ def send_friend_request(
     db.refresh(new_friendship)
 
     sender = db.query(Profile).filter(Profile.id == user_id).first()
-    sender_name = sender.username if sender else "Someone"
+    sender_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip() if sender else "Someone"
     send_notification(
         user_id=target_id,
         title="New Friend Request",
-        body=f"@{sender_name} sent you a friend request.",
+        body=f"{sender_name} sent you a friend request.",
         notif_type="friend_request",
         reference_id=str(new_friendship.id),
     )
@@ -111,8 +110,8 @@ def accept_friend_request(
 
     requester = db.query(Profile).filter(Profile.id == f.requester_id).first()
     addressee = db.query(Profile).filter(Profile.id == user_id).first()
-    requester_name = requester.username if requester else "this player"
-    addressee_name = addressee.username if addressee else "your friend"
+    requester_name = f"{requester.first_name or ''} {requester.last_name or ''}".strip() if requester else "this player"
+    addressee_name = f"{addressee.first_name or ''} {addressee.last_name or ''}".strip() if addressee else "your friend"
 
     existing_notifs = db.query(Notification).filter(
         Notification.user_id == user_id,
@@ -198,7 +197,7 @@ def get_friends(
                 **_profile_summary(profile),
             })
 
-    result.sort(key=lambda friend: (not friend["is_online"], friend["username"].lower()))
+    result.sort(key=lambda friend: (not friend["is_online"], f"{friend.get('first_name') or ''} {friend.get('last_name') or ''}".strip().lower()))
     online_count = sum(1 for friend in result if friend["is_online"])
 
     return {"friends": result, "count": len(result), "online_count": online_count}

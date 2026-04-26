@@ -24,7 +24,7 @@ def get_leaderboard(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    filters = ["sport = :sport", "match_format = :match_format"]
+    filters = ["sport = :sport", "match_format = :match_format", "is_leaderboard_eligible = TRUE"]
     params  = {"sport": sport, "match_format": match_format, "limit": limit}
 
     if region_code:
@@ -64,7 +64,6 @@ def get_profile_summary(
     first = dict(rows[0])
     profile = {
         "user_id":               first["user_id"],
-        "username":              first["username"],
         "first_name":            first["first_name"],
         "last_name":             first["last_name"],
         "profile_setup_complete": first["profile_setup_complete"],
@@ -105,7 +104,10 @@ def get_match_history(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    filters = ["(player1_id = :uid OR player2_id = :uid)"]
+    filters = ["""(
+        player1_id = :uid OR player2_id = :uid OR player3_id = :uid OR player4_id = :uid
+        OR team1_player1 = :uid OR team1_player2 = :uid OR team2_player1 = :uid OR team2_player2 = :uid
+    )"""]
     params  = {"uid": user_id, "limit": limit}
 
     if sport:

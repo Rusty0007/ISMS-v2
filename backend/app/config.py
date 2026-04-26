@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # --- App ---
     app_env: str = "development"
     allowed_origins: str = "http://localhost:3000"
+    match_approval_mode: str = "referee_only"
 
     # --- Anthropic (LLM insights) ---
     anthropic_api_key: str = ""
@@ -39,6 +40,17 @@ class Settings(BaseSettings):
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]
+
+    @property
+    def normalized_match_approval_mode(self) -> str:
+        value = (self.match_approval_mode or "club_admin").strip().lower()
+        if value in {"referee_only", "test", "bypass"}:
+            return "referee_only"
+        return "club_admin"
+
+    @property
+    def bypass_club_match_approval(self) -> bool:
+        return self.normalized_match_approval_mode == "referee_only"
 
 
 settings = Settings()  # type: ignore[call-arg]

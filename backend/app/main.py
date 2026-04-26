@@ -1,3 +1,6 @@
+import asyncio
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -6,11 +9,25 @@ import httpx
 import os
 from pathlib import Path
 from app.config import settings
-from app.routes import admin, auth, players, matches, courts, checkins, referee, views, clubs, insights, friends, rotations, tournaments, leaderboard, open_play, upload, parties
+from app.routes import admin, auth, players, matches, courts, checkins, referee, views, clubs, insights, friends, rotations, tournaments, leaderboard, open_play, upload, parties, feed, psgc
 from app.routes.lobby import router as lobby_router
-from app.database import engine
+from app.database import SessionLocal, engine
 from app.models import models
 from sqlalchemy import text
+from app.services.rating_rebuilder import (
+    RATING_REBUILD_STATE_KEY,
+    RATING_REBUILD_VERSION,
+    rebuild_all_ratings_from_history,
+)
+from app.services.rating_policy import (
+    LEADERBOARD_MIN_DISTINCT_OPPONENTS,
+    LEADERBOARD_MIN_MATCHES,
+    LEADERBOARD_RD_THRESHOLD,
+    ML_MATCHMAKING_MIN_MATCHES,
+)
+from app.utils.skill_tiers import SKILL_TIER_DEFINITIONS
+
+logger = logging.getLogger(__name__)
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -41,6 +58,7 @@ def _run_column_migrations():
         conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS referee_boost_until TIMESTAMPTZ"))
         conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS fcm_token TEXT"))
         conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE profiles ALTER COLUMN username DROP NOT NULL"))
         # matches — queue location snapshot
         conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS queue_city_code TEXT"))
         conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS queue_province_code TEXT"))
@@ -48,17 +66,69 @@ def _run_column_migrations():
         # player_ratings — calibration phase
         conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS rating_status TEXT DEFAULT 'CALIBRATING'"))
         conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS calibration_matches_played INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS distinct_opponents_count INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS is_matchmaking_eligible BOOLEAN DEFAULT FALSE"))
         conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS is_leaderboard_eligible BOOLEAN DEFAULT FALSE"))
         conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS calibration_completed_at TIMESTAMPTZ"))
-        # Back-fill: players with 10+ matches are already effectively rated
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_rating NUMERIC DEFAULT 50"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_confidence NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_coverage_pct NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_reliable BOOLEAN DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_matches_with_events INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_total_points INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_attributed_points INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_winning_shots NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_forced_errors_drawn NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_errors_committed NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_serve_faults NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_violations NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_clutch_points_won NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_clutch_errors NUMERIC DEFAULT 0"))
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_last_calculated_at TIMESTAMPTZ"))
+        # Back-fill coarse eligibility; the history rebuild below recomputes opponent diversity exactly.
         conn.execute(text("""
             UPDATE player_ratings
-            SET rating_status              = 'RATED',
-                calibration_matches_played = LEAST(matches_played, 10),
-                is_leaderboard_eligible    = TRUE,
-                calibration_completed_at   = updated_at
-            WHERE matches_played >= 10
-              AND (rating_status IS NULL OR rating_status = 'CALIBRATING')
+            SET calibration_matches_played = GREATEST(COALESCE(calibration_matches_played, 0), LEAST(COALESCE(matches_played, 0), :leaderboard_min_matches)),
+                is_matchmaking_eligible    = COALESCE(matches_played, 0) >= :ml_min_matches,
+                is_leaderboard_eligible    = COALESCE(matches_played, 0) >= :leaderboard_min_matches
+                                           AND COALESCE(distinct_opponents_count, 0) >= :leaderboard_min_opponents
+                                           AND COALESCE(rating_deviation, 999) <= :leaderboard_rd_threshold,
+                rating_status              = CASE
+                    WHEN COALESCE(matches_played, 0) >= :leaderboard_min_matches
+                     AND COALESCE(distinct_opponents_count, 0) >= :leaderboard_min_opponents
+                     AND COALESCE(rating_deviation, 999) <= :leaderboard_rd_threshold
+                    THEN 'RATED'
+                    ELSE COALESCE(rating_status, 'CALIBRATING')
+                END,
+                calibration_completed_at   = CASE
+                    WHEN COALESCE(matches_played, 0) >= :leaderboard_min_matches
+                     AND COALESCE(distinct_opponents_count, 0) >= :leaderboard_min_opponents
+                     AND COALESCE(rating_deviation, 999) <= :leaderboard_rd_threshold
+                    THEN COALESCE(calibration_completed_at, updated_at, NOW())
+                    ELSE calibration_completed_at
+                END
+        """), {
+            "ml_min_matches": ML_MATCHMAKING_MIN_MATCHES,
+            "leaderboard_min_matches": LEADERBOARD_MIN_MATCHES,
+            "leaderboard_min_opponents": LEADERBOARD_MIN_DISTINCT_OPPONENTS,
+            "leaderboard_rd_threshold": LEADERBOARD_RD_THRESHOLD,
+        })
+        conn.execute(text("""
+            UPDATE player_ratings
+            SET performance_rating = COALESCE(performance_rating, 50),
+                performance_confidence = COALESCE(performance_confidence, 0),
+                performance_coverage_pct = COALESCE(performance_coverage_pct, 0),
+                performance_reliable = COALESCE(performance_reliable, FALSE),
+                performance_matches_with_events = COALESCE(performance_matches_with_events, 0),
+                performance_total_points = COALESCE(performance_total_points, 0),
+                performance_attributed_points = COALESCE(performance_attributed_points, 0),
+                performance_winning_shots = COALESCE(performance_winning_shots, 0),
+                performance_forced_errors_drawn = COALESCE(performance_forced_errors_drawn, 0),
+                performance_errors_committed = COALESCE(performance_errors_committed, 0),
+                performance_serve_faults = COALESCE(performance_serve_faults, 0),
+                performance_violations = COALESCE(performance_violations, 0),
+                performance_clutch_points_won = COALESCE(performance_clutch_points_won, 0),
+                performance_clutch_errors = COALESCE(performance_clutch_errors, 0)
         """))
         # profiles — gender
         conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS gender TEXT"))
@@ -84,10 +154,119 @@ def _run_column_migrations():
         conn.execute(text("ALTER TABLE court_bookings ALTER COLUMN club_id DROP NOT NULL"))
         # tournaments — knockout best-of setting (1 = BO1, 3 = BO3)
         conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS knockout_best_of INTEGER NOT NULL DEFAULT 3"))
+        # tournaments — group stage / pool / round-robin / swiss per-match best-of
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS group_stage_best_of INTEGER NOT NULL DEFAULT 1"))
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS venue_mode TEXT NOT NULL DEFAULT 'tbd'"))
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS venue_name TEXT"))
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS venue_address TEXT"))
+        conn.execute(text("""
+            UPDATE tournaments
+            SET venue_mode = 'club'
+            WHERE club_id IS NOT NULL
+              AND (venue_mode IS NULL OR venue_mode = 'tbd')
+        """))
+        # open play sessions — live operations settings
+        conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS match_format TEXT NOT NULL DEFAULT 'doubles'"))
+        conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT 'fifo'"))
+        conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS rotation_mode TEXT NOT NULL DEFAULT 'four_on_four_off'"))
+        conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS ack_timeout_seconds INTEGER NOT NULL DEFAULT 60"))
+        conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS target_score INTEGER DEFAULT 11"))
+        conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS win_by_two BOOLEAN DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS auto_assign_enabled BOOLEAN DEFAULT TRUE"))
+        # open play runtime tables
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS open_play_session_courts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                session_id UUID NOT NULL REFERENCES open_play_sessions(id) ON DELETE CASCADE,
+                court_id UUID NOT NULL REFERENCES courts(id) ON DELETE CASCADE,
+                display_order INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'available',
+                is_active BOOLEAN DEFAULT TRUE,
+                court_role TEXT NOT NULL DEFAULT 'standard',
+                consecutive_wins INTEGER DEFAULT 0,
+                max_consecutive_wins INTEGER,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS open_play_queue_entries (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                session_id UUID NOT NULL REFERENCES open_play_sessions(id) ON DELETE CASCADE,
+                created_by UUID NOT NULL REFERENCES profiles(id),
+                player1_id UUID NOT NULL REFERENCES profiles(id),
+                player2_id UUID REFERENCES profiles(id),
+                entry_kind TEXT NOT NULL DEFAULT 'solo',
+                status TEXT NOT NULL DEFAULT 'waiting',
+                is_ready BOOLEAN DEFAULT TRUE,
+                skip_count INTEGER DEFAULT 0,
+                queued_at TIMESTAMPTZ DEFAULT NOW(),
+                last_called_at TIMESTAMPTZ,
+                last_played_at TIMESTAMPTZ,
+                holding_court_id UUID REFERENCES open_play_session_courts(id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS open_play_assignments (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                session_id UUID NOT NULL REFERENCES open_play_sessions(id) ON DELETE CASCADE,
+                session_court_id UUID NOT NULL REFERENCES open_play_session_courts(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'called',
+                assigned_at TIMESTAMPTZ DEFAULT NOW(),
+                ack_deadline_at TIMESTAMPTZ,
+                started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                winner_side INTEGER,
+                side1_score INTEGER,
+                side2_score INTEGER
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS open_play_assignment_players (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                assignment_id UUID NOT NULL REFERENCES open_play_assignments(id) ON DELETE CASCADE,
+                queue_entry_id UUID REFERENCES open_play_queue_entries(id) ON DELETE SET NULL,
+                user_id UUID NOT NULL REFERENCES profiles(id),
+                side_no INTEGER NOT NULL,
+                seat_no INTEGER NOT NULL DEFAULT 1,
+                acknowledged_at TIMESTAMPTZ,
+                outcome TEXT
+            )
+        """))
         # matches — party support
+        conn.execute(text("ALTER TABLE open_play_session_courts ADD COLUMN IF NOT EXISTS court_role TEXT NOT NULL DEFAULT 'standard'"))
+        conn.execute(text("ALTER TABLE open_play_session_courts ADD COLUMN IF NOT EXISTS max_consecutive_wins INTEGER"))
+        conn.execute(text("ALTER TABLE open_play_assignments ADD COLUMN IF NOT EXISTS side1_score INTEGER"))
+        conn.execute(text("ALTER TABLE open_play_assignments ADD COLUMN IF NOT EXISTS side2_score INTEGER"))
         conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS party_id UUID REFERENCES parties(id)"))
         # matches — per-match score limit override
         conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS score_limit INTEGER"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS tournament_phase TEXT"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS called_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS checkin_deadline_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS team1_ready_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS team2_ready_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS referee_ready_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_submitted_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_submitted_by UUID REFERENCES profiles(id)"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_confirmed_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_confirmed_by UUID REFERENCES profiles(id)"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS dispute_reason TEXT"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS upcoming_reminder_10_sent_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS upcoming_reminder_5_sent_at TIMESTAMPTZ"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS tournament_referee_registrations (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tournament_id UUID NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+                user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                registered_by UUID REFERENCES profiles(id),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_tournament_referee_registrations_tournament_user
+            ON tournament_referee_registrations (tournament_id, user_id)
+        """))
         # match lobby — pre-match readiness checkpoint
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS match_lobby_players (
@@ -124,6 +303,103 @@ def _run_column_migrations():
             CREATE UNIQUE INDEX IF NOT EXISTS ux_match_lobby_players_match_user
             ON match_lobby_players (match_id, user_id)
         """))
+        # feed
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS feed_posts (
+                id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                author_id     UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                post_type     TEXT NOT NULL DEFAULT 'manual',
+                content       TEXT,
+                image_url     TEXT,
+                club_id       UUID REFERENCES clubs(id) ON DELETE SET NULL,
+                tournament_id UUID REFERENCES tournaments(id) ON DELETE SET NULL,
+                match_id      UUID REFERENCES matches(id) ON DELETE SET NULL,
+                open_play_id  UUID REFERENCES open_play_sessions(id) ON DELETE SET NULL,
+                meta          JSONB,
+                is_pinned     BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS post_comments (
+                id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                post_id    UUID NOT NULL REFERENCES feed_posts(id) ON DELETE CASCADE,
+                author_id  UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                parent_id  UUID REFERENCES post_comments(id) ON DELETE CASCADE,
+                content    TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS post_reactions (
+                id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                post_id    UUID NOT NULL REFERENCES feed_posts(id) ON DELETE CASCADE,
+                user_id    UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                reaction   TEXT NOT NULL DEFAULT 'like',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_post_reactions_post_user
+            ON post_reactions (post_id, user_id)
+        """))
+        conn.execute(text("ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS team_name TEXT"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS system_maintenance_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        # Repair: reset ratings/volatility that reached unsafe Glicko-2 bounds.
+        # Legitimate ratings are clamped to [500, 2700] by glicko2.py.
+        # Values outside this range (e.g. timestamps stored as integers, or
+        # old data from when volatility could explode) are corrupted.
+        # Reset them to the default starting rating so Glicko-2 re-calibrates.
+        conn.execute(text("""
+            UPDATE player_ratings
+            SET rating = CASE
+                    WHEN rating >= 2700 OR rating <= 500 OR rating IS NULL THEN 1500
+                    ELSE rating
+                END,
+                rating_deviation = CASE
+                    WHEN rating >= 2700 OR rating <= 500 OR rating IS NULL
+                         OR rating_deviation IS NULL OR rating_deviation <= 0 OR rating_deviation > 500
+                    THEN 350
+                    ELSE rating_deviation
+                END,
+                volatility = CASE
+                    WHEN rating >= 2700 OR rating <= 500 OR rating IS NULL
+                         OR volatility IS NULL OR volatility <= 0 OR volatility > 0.2
+                    THEN 0.06
+                    ELSE volatility
+                END,
+                is_matchmaking_eligible = FALSE,
+                is_leaderboard_eligible = FALSE,
+                rating_status = 'CALIBRATING',
+                calibration_completed_at = NULL
+            WHERE rating >= 2700 OR rating <= 500 OR rating IS NULL
+               OR rating_deviation IS NULL OR rating_deviation <= 0 OR rating_deviation > 500
+               OR volatility IS NULL OR volatility <= 0 OR volatility > 0.2
+        """))
+        # ── Repair: remove duplicate player_ratings rows ─────────────────────
+        # Keep the row with the most matches_played per (user_id, sport, match_format).
+        # Ties are broken by the largest rating value.
+        conn.execute(text("""
+            DELETE FROM player_ratings
+            WHERE id NOT IN (
+                SELECT DISTINCT ON (user_id, sport, match_format) id
+                FROM player_ratings
+                ORDER BY user_id, sport, match_format,
+                         matches_played DESC NULLS LAST,
+                         rating DESC NULLS LAST
+            )
+        """))
+        # ── Add unique constraint to prevent future duplicates ────────────────
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_player_ratings_user_sport_format
+            ON player_ratings (user_id, sport, match_format)
+        """))
         conn.commit()
 
     # PostgreSQL enum ALTER must run outside a transaction (AUTOCOMMIT)
@@ -151,29 +427,70 @@ def _run_competitive_tier_setup():
                 is_active                BOOLEAN DEFAULT TRUE
             )
         """))
-        # Add rd_threshold to existing tables that predate this column
+        # Keep the ranking-level schema current on existing databases.
         conn.execute(text("ALTER TABLE ranking_levels ADD COLUMN IF NOT EXISTS rd_threshold NUMERIC DEFAULT 200"))
         # parties — shared queue start timestamp so both players can sync their timer
         conn.execute(text("ALTER TABLE parties ADD COLUMN IF NOT EXISTS queue_started_at TIMESTAMPTZ"))
-        # Widen bands to 200-point gaps; add RD threshold; update match requirements.
-        # ON CONFLICT DO UPDATE so existing rows are corrected on every restart.
+        # Replace the legacy geo-named ladder with the requested
+        # point-based Dreyfus skill categories.
         conn.execute(text("""
-            INSERT INTO ranking_levels
-                (id, level_name, min_rating, max_rating, display_order, is_top_level, minimum_matches_required, rd_threshold)
-            VALUES
-                (gen_random_uuid(), 'Barangay',       1500, 1699, 1, FALSE,  3, 200),
-                (gen_random_uuid(), 'City/Municipal', 1700, 1899, 2, FALSE,  5, 200),
-                (gen_random_uuid(), 'Provincial',     1900, 2099, 3, FALSE,  8, 200),
-                (gen_random_uuid(), 'Regional',       2100, 2299, 4, FALSE, 10, 200),
-                (gen_random_uuid(), 'National',       2300, NULL, 5, TRUE,  12, 200)
-            ON CONFLICT (level_name) DO UPDATE SET
-                min_rating               = EXCLUDED.min_rating,
-                max_rating               = EXCLUDED.max_rating,
-                display_order            = EXCLUDED.display_order,
-                is_top_level             = EXCLUDED.is_top_level,
-                minimum_matches_required = EXCLUDED.minimum_matches_required,
-                rd_threshold             = EXCLUDED.rd_threshold
+            DELETE FROM ranking_levels
+            WHERE level_name IN (
+                'Barangay',
+                'City/Municipal',
+                'Provincial',
+                'Regional',
+                'National'
+            )
         """))
+        conn.execute(
+            text("""
+                INSERT INTO ranking_levels
+                    (
+                        id,
+                        level_name,
+                        min_rating,
+                        max_rating,
+                        display_order,
+                        is_top_level,
+                        minimum_matches_required,
+                        rd_threshold,
+                        is_active
+                    )
+                VALUES
+                    (
+                        gen_random_uuid(),
+                        :level_name,
+                        :min_rating,
+                        :max_rating,
+                        :display_order,
+                        :is_top_level,
+                        :minimum_matches_required,
+                        :rd_threshold,
+                        TRUE
+                    )
+                ON CONFLICT (level_name) DO UPDATE SET
+                    min_rating               = EXCLUDED.min_rating,
+                    max_rating               = EXCLUDED.max_rating,
+                    display_order            = EXCLUDED.display_order,
+                    is_top_level             = EXCLUDED.is_top_level,
+                    minimum_matches_required = EXCLUDED.minimum_matches_required,
+                    rd_threshold             = EXCLUDED.rd_threshold,
+                    is_active                = EXCLUDED.is_active
+            """),
+            [
+                {
+                    "level_name": tier.name,
+                    "min_rating": tier.min_rating,
+                    "max_rating": tier.max_rating,
+                    "display_order": tier.display_order,
+                    "is_top_level": tier.max_rating is None,
+                    "minimum_matches_required": tier.minimum_matches_required,
+                    "rd_threshold": tier.rd_threshold,
+                }
+                for tier in SKILL_TIER_DEFINITIONS
+            ],
+        )
         conn.commit()
 
 _run_competitive_tier_setup()
@@ -185,7 +502,7 @@ def _run_stored_procedures():
             DROP FUNCTION IF EXISTS fn_complete_match(uuid,uuid,numeric,numeric,numeric,numeric,numeric,numeric);
         """))
         conn.commit()
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE OR REPLACE FUNCTION fn_complete_match(
                 p_match_id    UUID,
                 p_winner_id   UUID,
@@ -299,26 +616,14 @@ def _run_stored_procedures():
                     END IF;
                 END IF;
 
-                -- 8. Calibration: increment counter; graduate to RATED after 10 verified matches
+                -- 8. Calibration: {ML_MATCHMAKING_MIN_MATCHES} matches unlock ML matchmaking.
+                -- Leaderboard eligibility is refreshed in Python because it depends
+                -- on distinct opponent counts across match history.
                 UPDATE player_ratings SET
                     calibration_matches_played = calibration_matches_played + 1,
-                    rating_status = CASE
-                        WHEN rating_status = 'CALIBRATING'
-                             AND calibration_matches_played + 1 >= 10
-                        THEN 'RATED'
-                        ELSE rating_status
-                    END,
-                    is_leaderboard_eligible = CASE
-                        WHEN rating_status = 'CALIBRATING'
-                             AND calibration_matches_played + 1 >= 10
-                        THEN TRUE
-                        ELSE is_leaderboard_eligible
-                    END,
-                    calibration_completed_at = CASE
-                        WHEN rating_status = 'CALIBRATING'
-                             AND calibration_matches_played + 1 >= 10
-                        THEN NOW()
-                        ELSE calibration_completed_at
+                    is_matchmaking_eligible = CASE
+                        WHEN calibration_matches_played + 1 >= {ML_MATCHMAKING_MIN_MATCHES} THEN TRUE
+                        ELSE is_matchmaking_eligible
                     END
                 WHERE user_id IN (v_player1_id, v_player2_id)
                   AND sport::TEXT   = v_sport
@@ -329,6 +634,39 @@ def _run_stored_procedures():
         conn.commit()
 
 _run_stored_procedures()
+
+
+def _run_rating_history_rebuild_once():
+    db = SessionLocal()
+    try:
+        current_version = db.execute(
+            text("SELECT value FROM system_maintenance_state WHERE key = :key"),
+            {"key": RATING_REBUILD_STATE_KEY},
+        ).scalar()
+        if current_version == RATING_REBUILD_VERSION:
+            return
+
+        summary = rebuild_all_ratings_from_history(db)
+        db.execute(
+            text("""
+                INSERT INTO system_maintenance_state (key, value, updated_at)
+                VALUES (:key, :value, NOW())
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value,
+                    updated_at = EXCLUDED.updated_at
+            """),
+            {"key": RATING_REBUILD_STATE_KEY, "value": RATING_REBUILD_VERSION},
+        )
+        db.commit()
+        logger.warning(f"[ratings] Rebuilt ratings from match history: {summary.to_dict()}")
+    except Exception as exc:
+        db.rollback()
+        logger.warning(f"[ratings] Skipped history rebuild after failure: {exc}")
+    finally:
+        db.close()
+
+
+_run_rating_history_rebuild_once()
 
 
 def _run_view_setup():
@@ -345,7 +683,6 @@ def _run_view_setup():
             CREATE OR REPLACE VIEW leaderboard_view AS
             SELECT
                 pr.user_id,
-                p.username,
                 p.first_name,
                 p.last_name,
                 p.avatar_url,
@@ -364,6 +701,8 @@ def _run_view_setup():
                 pr.current_win_streak,
                 pr.current_loss_streak,
                 pr.activeness_score,
+                pr.distinct_opponents_count,
+                pr.is_matchmaking_eligible,
                 pr.is_leaderboard_eligible,
                 pr.rating_status,
                 CASE WHEN pr.matches_played > 0
@@ -382,7 +721,6 @@ def _run_view_setup():
             CREATE OR REPLACE VIEW player_profile_summary AS
             SELECT
                 p.id AS user_id,
-                p.username,
                 p.first_name,
                 p.last_name,
                 p.avatar_url,
@@ -402,6 +740,9 @@ def _run_view_setup():
                 pr.matches_played,
                 pr.current_win_streak,
                 pr.activeness_score,
+                pr.distinct_opponents_count,
+                pr.is_matchmaking_eligible,
+                pr.is_leaderboard_eligible,
                 CASE WHEN pr.matches_played > 0
                      THEN ROUND((pr.wins::NUMERIC / pr.matches_played) * 100, 1)
                      ELSE 0
@@ -418,9 +759,9 @@ def _run_view_setup():
             CREATE OR REPLACE VIEW match_history_view AS
             SELECT
                 m.*,
-                p1.username AS player1_username,
+                TRIM(COALESCE(p1.first_name,'') || ' ' || COALESCE(p1.last_name,'')) AS player1_name,
                 p1.avatar_url AS player1_avatar,
-                p2.username AS player2_username,
+                TRIM(COALESCE(p2.first_name,'') || ' ' || COALESCE(p2.last_name,'')) AS player2_name,
                 p2.avatar_url AS player2_avatar
             FROM matches m
             LEFT JOIN profiles p1 ON p1.id = m.player1_id
@@ -430,7 +771,6 @@ def _run_view_setup():
             CREATE OR REPLACE VIEW active_queue_view AS
             SELECT
                 mq.*,
-                p.username,
                 p.avatar_url,
                 p.region_code   AS profile_region_code,
                 p.province_code AS profile_province_code,
@@ -446,7 +786,7 @@ def _run_view_setup():
                 tg.group_name,
                 tr.player_id,
                 tr.partner_id,
-                p.username AS player_username,
+                TRIM(COALESCE(p.first_name,'') || ' ' || COALESCE(p.last_name,'')) AS player_name,
                 p.avatar_url AS player_avatar
             FROM tournament_group_standings tgs
             JOIN tournament_groups tg ON tg.id = tgs.group_id
@@ -485,11 +825,70 @@ async def httpx_read_error_handler(request, exc):
     )
 
 
+async def _tournament_reminder_loop():
+    from app.services.tournament_runtime import dispatch_due_tournament_match_reminders
+
+    while True:
+        db = SessionLocal()
+        try:
+            dispatch_due_tournament_match_reminders(db)
+        except Exception as exc:
+            logger.warning(f"[tournament-reminders] Reminder sweep failed: {exc}")
+            db.rollback()
+        finally:
+            db.close()
+        await asyncio.sleep(60)
+
+
+async def _match_start_timeout_loop():
+    from app.routes.matches import dispatch_due_match_start_timeouts
+
+    while True:
+        db = SessionLocal()
+        try:
+            dispatch_due_match_start_timeouts(db)
+        except Exception as exc:
+            logger.warning(f"[match-start-timeouts] Sweep failed: {exc}")
+            db.rollback()
+        finally:
+            db.close()
+        await asyncio.sleep(30)
+
+
+@app.on_event("startup")
+async def start_tournament_reminders():
+    if getattr(app.state, "tournament_reminder_task", None) is None:
+        app.state.tournament_reminder_task = asyncio.create_task(_tournament_reminder_loop())
+    if getattr(app.state, "match_start_timeout_task", None) is None:
+        app.state.match_start_timeout_task = asyncio.create_task(_match_start_timeout_loop())
+
+
+@app.on_event("shutdown")
+async def stop_tournament_reminders():
+    task = getattr(app.state, "tournament_reminder_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        app.state.tournament_reminder_task = None
+
+    timeout_task = getattr(app.state, "match_start_timeout_task", None)
+    if timeout_task is not None:
+        timeout_task.cancel()
+        try:
+            await timeout_task
+        except asyncio.CancelledError:
+            pass
+        app.state.match_start_timeout_task = None
+
+
 # ── Routers ──────────────────────────────────────────────────────────────────
 app.include_router(auth.router,         prefix="/auth",         tags=["Authentication"])
 app.include_router(players.router,      prefix="/players",      tags=["Players"])
-app.include_router(matches.router,      prefix="/matches",      tags=["Matches"])
 app.include_router(courts.router,       prefix="/matches",      tags=["Courts"])
+app.include_router(matches.router,      prefix="/matches",      tags=["Matches"])
 app.include_router(checkins.router,     prefix="/club check-ins", tags=["Club Check-ins"])
 app.include_router(referee.router,      prefix="",              tags=["Referee"])
 app.include_router(views.router,        prefix="/views",        tags=["Views"])
@@ -504,6 +903,8 @@ app.include_router(open_play.router,    prefix="",               tags=["Open Pla
 app.include_router(parties.router,      prefix="",               tags=["Parties"])
 app.include_router(upload.router,       prefix="/upload",        tags=["Upload"])
 app.include_router(lobby_router,        prefix="",               tags=["Lobby"])
+app.include_router(feed.router,         prefix="/feed",          tags=["Feed"])
+app.include_router(psgc.router,         prefix="/psgc",          tags=["PSGC"])
 
 # Serve uploaded files — must be mounted AFTER routers
 _upload_dir = Path(os.environ.get("UPLOAD_DIR", "/app/uploads"))

@@ -2,6 +2,17 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
   db:
     image: postgis/postgis:15-3.4-alpine
@@ -20,6 +31,12 @@ services:
       -c log_min_duration_statement=0
       -c log_destination=stderr
       -c logging_collector=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U isms_user -d isms_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -33,6 +50,25 @@ services:
     depends_on:
       - db
 
+  # ── Pre-deploy migration runner ──────────────────────────────────────────
+  # In production, run `docker compose run --rm migrate` BEFORE starting
+  # the backend to avoid holding ACCESS EXCLUSIVE locks while serving traffic.
+  # For local development the backend runs migrations inline on startup anyway.
+  migrate:
+    build: ./backend
+    command: python migrate.py
+    volumes:
+      - ./backend:/app
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql://isms_user:isms_password@db:5432/isms_db
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    profiles:
+      - migrate
+
   backend:
     build: ./backend
     ports:
@@ -43,13 +79,27 @@ services:
     env_file: ./backend/.env
     environment:
       REDIS_URL: redis://redis:6379
-      ALLOWED_ORIGINS: http://localhost:3000
+      ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
       DATABASE_URL: postgresql://isms_user:isms_password@db:5432/isms_db
       LOCAL_DB_URL: postgresql://isms_user:isms_password@db:5432/isms_db
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import sys, urllib.request; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).getcode() == 200 else sys.exit(1)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
 
   frontend:
     build:
@@ -61,8 +111,23 @@ services:
     environment:
       BACKEND_URL: http://backend:8000
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
+
+
+  # ── Production reverse proxy (optional) ─────────────────────────────────
+  # Uncomment when deploying behind Nginx to get correct SSE timeouts.
+  # nginx:
+  #   image: nginx:1.27-alpine
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on:
+  #     - frontend
+  #     - backend
 
 
 volumes:

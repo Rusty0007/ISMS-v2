@@ -67,8 +67,8 @@ class Profile(Base):
     __tablename__ = "profiles"
 
     id                     = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    username               = Column(String, unique=True, nullable=False)
     email                  = Column(String, unique=True)
+    username               = Column(String, unique=True, nullable=True)
     hashed_password        = Column(Text)
     avatar_url             = Column(Text)
     first_name             = Column(String)
@@ -131,8 +131,27 @@ class PlayerRating(Base):
     # Calibration
     rating_status              = Column(String, default="CALIBRATING")   # CALIBRATING | RATED
     calibration_matches_played = Column(Integer, default=0)
+    distinct_opponents_count   = Column(Integer, default=0)
+    is_matchmaking_eligible    = Column(Boolean, default=False)
     is_leaderboard_eligible    = Column(Boolean, default=False)
     calibration_completed_at   = Column(TIMESTAMP(timezone=True))
+    # Individual point-attribution performance tracking. This complements SR and
+    # is kept separate so official ladder placement still comes from match wins.
+    performance_rating               = Column(Numeric, default=50)
+    performance_confidence           = Column(Numeric, default=0)
+    performance_coverage_pct         = Column(Numeric, default=0)
+    performance_reliable             = Column(Boolean, default=False)
+    performance_matches_with_events  = Column(Integer, default=0)
+    performance_total_points         = Column(Integer, default=0)
+    performance_attributed_points    = Column(Integer, default=0)
+    performance_winning_shots        = Column(Numeric, default=0)
+    performance_forced_errors_drawn  = Column(Numeric, default=0)
+    performance_errors_committed     = Column(Numeric, default=0)
+    performance_serve_faults         = Column(Numeric, default=0)
+    performance_violations           = Column(Numeric, default=0)
+    performance_clutch_points_won    = Column(Numeric, default=0)
+    performance_clutch_errors        = Column(Numeric, default=0)
+    performance_last_calculated_at   = Column(TIMESTAMP(timezone=True))
     updated_at                 = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     user                = relationship("Profile", back_populates="ratings")
@@ -199,17 +218,27 @@ class OpenPlaySession(Base):
     title          = Column(String, nullable=False)
     description    = Column(Text)
     sport          = Column(String, nullable=False)
+    match_format   = Column(String, nullable=False, default="doubles")  # singles|doubles|mixed_doubles
     session_date   = Column(TIMESTAMP(timezone=True), nullable=False)
     duration_hours = Column(Numeric, default=1)
     max_players    = Column(Integer, nullable=False)
     price_per_head = Column(Numeric, default=0)
     status         = Column(String, nullable=False, default="upcoming")  # upcoming|ongoing|completed|cancelled
+    queue_mode     = Column(String, nullable=False, default="fifo")  # fifo|balanced
+    rotation_mode  = Column(String, nullable=False, default="four_on_four_off")  # four_on_four_off|winners_stay_two_off
+    ack_timeout_seconds = Column(Integer, nullable=False, default=60)
+    target_score   = Column(Integer, default=11)
+    win_by_two     = Column(Boolean, default=False)
+    auto_assign_enabled = Column(Boolean, default=True)
     skill_min      = Column(Numeric)
     skill_max      = Column(Numeric)
     notes          = Column(Text)
     created_at     = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     participants   = relationship("OpenPlayParticipant", back_populates="session", cascade="all, delete")
+    session_courts = relationship("OpenPlaySessionCourt", back_populates="session", cascade="all, delete")
+    queue_entries  = relationship("OpenPlayQueueEntry", back_populates="session", cascade="all, delete")
+    assignments    = relationship("OpenPlayAssignment", back_populates="session", cascade="all, delete")
 
 
 class OpenPlayParticipant(Base):
@@ -222,6 +251,78 @@ class OpenPlayParticipant(Base):
     joined_at  = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     session    = relationship("OpenPlaySession", back_populates="participants")
+
+
+class OpenPlaySessionCourt(Base):
+    __tablename__ = "open_play_session_courts"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id   = Column(UUID(as_uuid=True), ForeignKey("open_play_sessions.id", ondelete="CASCADE"), nullable=False)
+    court_id     = Column(UUID(as_uuid=True), ForeignKey("courts.id", ondelete="CASCADE"), nullable=False)
+    display_order = Column(Integer, nullable=False, default=1)
+    status       = Column(String, nullable=False, default="available")  # available|awaiting_ack|occupied|paused|closed
+    is_active    = Column(Boolean, default=True)
+    court_role   = Column(String, nullable=False, default="standard")  # standard|challenge
+    consecutive_wins = Column(Integer, default=0)
+    max_consecutive_wins = Column(Integer)
+    created_at   = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    session      = relationship("OpenPlaySession", back_populates="session_courts")
+
+
+class OpenPlayQueueEntry(Base):
+    __tablename__ = "open_play_queue_entries"
+
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id    = Column(UUID(as_uuid=True), ForeignKey("open_play_sessions.id", ondelete="CASCADE"), nullable=False)
+    created_by    = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
+    player1_id    = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
+    player2_id    = Column(UUID(as_uuid=True), ForeignKey("profiles.id"))
+    entry_kind    = Column(String, nullable=False, default="solo")  # solo|pair
+    status        = Column(String, nullable=False, default="waiting")  # waiting|called|holding|playing|paused|cancelled
+    is_ready      = Column(Boolean, default=True)
+    skip_count    = Column(Integer, default=0)
+    queued_at     = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    last_called_at = Column(TIMESTAMP(timezone=True))
+    last_played_at = Column(TIMESTAMP(timezone=True))
+    holding_court_id = Column(UUID(as_uuid=True), ForeignKey("open_play_session_courts.id"))
+    created_at    = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    session       = relationship("OpenPlaySession", back_populates="queue_entries")
+
+
+class OpenPlayAssignment(Base):
+    __tablename__ = "open_play_assignments"
+
+    id             = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id      = Column(UUID(as_uuid=True), ForeignKey("open_play_sessions.id", ondelete="CASCADE"), nullable=False)
+    session_court_id = Column(UUID(as_uuid=True), ForeignKey("open_play_session_courts.id", ondelete="CASCADE"), nullable=False)
+    status         = Column(String, nullable=False, default="called")  # called|in_game|completed|expired|cancelled
+    assigned_at    = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    ack_deadline_at = Column(TIMESTAMP(timezone=True))
+    started_at     = Column(TIMESTAMP(timezone=True))
+    completed_at   = Column(TIMESTAMP(timezone=True))
+    winner_side    = Column(Integer)
+    side1_score    = Column(Integer)
+    side2_score    = Column(Integer)
+
+    session        = relationship("OpenPlaySession", back_populates="assignments")
+    players        = relationship("OpenPlayAssignmentPlayer", back_populates="assignment", cascade="all, delete")
+
+
+class OpenPlayAssignmentPlayer(Base):
+    __tablename__ = "open_play_assignment_players"
+
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    assignment_id  = Column(UUID(as_uuid=True), ForeignKey("open_play_assignments.id", ondelete="CASCADE"), nullable=False)
+    queue_entry_id = Column(UUID(as_uuid=True), ForeignKey("open_play_queue_entries.id", ondelete="SET NULL"))
+    user_id        = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
+    side_no        = Column(Integer, nullable=False)
+    seat_no        = Column(Integer, nullable=False, default=1)
+    acknowledged_at = Column(TIMESTAMP(timezone=True))
+    outcome        = Column(String)
+
+    assignment     = relationship("OpenPlayAssignment", back_populates="players")
 
 
 class Party(Base):
@@ -324,6 +425,9 @@ class Tournament(Base):
     match_format      = Column(String, nullable=False, default="singles")
     organizer_id      = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
     club_id           = Column(UUID(as_uuid=True), ForeignKey("clubs.id"))
+    venue_mode        = Column(String, default="tbd", nullable=False)
+    venue_name        = Column(String)
+    venue_address     = Column(Text)
     max_participants  = Column(Integer, default=32)
     status            = Column(String, default="upcoming")
     registration_open = Column(Boolean, default=True)
@@ -340,7 +444,9 @@ class Tournament(Base):
     max_rating        = Column(Numeric)
     requires_approval  = Column(Boolean, default=False, nullable=False)
     # 1 = Best of 1 (single game), 3 = Best of 3 (first to win 2 games)
-    knockout_best_of   = Column(Integer, default=3, nullable=False)
+    knockout_best_of      = Column(Integer, default=3, nullable=False)
+    # group stage / pool / round-robin / swiss per-match best-of (1 or 3)
+    group_stage_best_of   = Column(Integer, default=1, nullable=False)
     created_at         = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
@@ -376,6 +482,19 @@ class Match(Base):
     queue_city_code     = Column(String)   # resolved play location snapshot at queue-join time
     queue_province_code = Column(String)
     queue_region_code   = Column(String)
+    tournament_phase = Column(String)   # awaiting_assignment|scheduled|called|ready|ongoing|result_pending|verified|disputed|completed|walkover
+    called_at       = Column(TIMESTAMP(timezone=True))
+    checkin_deadline_at = Column(TIMESTAMP(timezone=True))
+    team1_ready_at  = Column(TIMESTAMP(timezone=True))
+    team2_ready_at  = Column(TIMESTAMP(timezone=True))
+    referee_ready_at = Column(TIMESTAMP(timezone=True))
+    result_submitted_at = Column(TIMESTAMP(timezone=True))
+    result_submitted_by = Column(UUID(as_uuid=True), ForeignKey("profiles.id"))
+    result_confirmed_at = Column(TIMESTAMP(timezone=True))
+    result_confirmed_by = Column(UUID(as_uuid=True), ForeignKey("profiles.id"))
+    dispute_reason  = Column(Text)
+    upcoming_reminder_10_sent_at = Column(TIMESTAMP(timezone=True))
+    upcoming_reminder_5_sent_at  = Column(TIMESTAMP(timezone=True))
     scheduled_at   = Column(TIMESTAMP(timezone=True))
     started_at     = Column(TIMESTAMP(timezone=True))
     completed_at   = Column(TIMESTAMP(timezone=True))
@@ -489,12 +608,23 @@ class TournamentRegistration(Base):
     tournament_id = Column(UUID(as_uuid=True), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
     player_id     = Column(UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=False)
     partner_id    = Column(UUID(as_uuid=True), ForeignKey("profiles.id"))
+    team_name     = Column(String)
     seed          = Column(Integer)
     # confirmed | invited | pending_approval | pending_partner | declined
     status        = Column(String, default="confirmed", nullable=False)
     # self_registered | organizer_invited
     source        = Column(String, default="self_registered", nullable=False)
     registered_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class TournamentRefereeRegistration(Base):
+    __tablename__ = "tournament_referee_registrations"
+
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tournament_id = Column(UUID(as_uuid=True), ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False)
+    user_id       = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    registered_by = Column(UUID(as_uuid=True), ForeignKey("profiles.id"))
+    created_at    = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
 class TournamentGroup(Base):
@@ -558,6 +688,57 @@ class LeaderboardCache(Base):
     rating     = Column(Numeric, nullable=False)
     rank       = Column(Integer)
     updated_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+# ── Feed ──────────────────────────────────────────────────────────────────────
+
+class FeedPost(Base):
+    __tablename__ = "feed_posts"
+
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    author_id     = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    # manual | match_result | tournament_update | open_play_invite | announcement
+    post_type     = Column(String, nullable=False, default="manual")
+    content       = Column(Text)
+    image_url     = Column(Text)
+    # Optional context links
+    club_id       = Column(UUID(as_uuid=True), ForeignKey("clubs.id", ondelete="SET NULL"))
+    tournament_id = Column(UUID(as_uuid=True), ForeignKey("tournaments.id", ondelete="SET NULL"))
+    match_id      = Column(UUID(as_uuid=True), ForeignKey("matches.id", ondelete="SET NULL"))
+    open_play_id  = Column(UUID(as_uuid=True), ForeignKey("open_play_sessions.id", ondelete="SET NULL"))
+    # Structured payload for special post types
+    meta          = Column(JSONB)
+    is_pinned     = Column(Boolean, default=False)
+    created_at    = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    comments      = relationship("PostComment",  back_populates="post", cascade="all, delete")
+    reactions     = relationship("PostReaction", back_populates="post", cascade="all, delete")
+
+
+class PostComment(Base):
+    __tablename__ = "post_comments"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    post_id    = Column(UUID(as_uuid=True), ForeignKey("feed_posts.id",    ondelete="CASCADE"), nullable=False)
+    author_id  = Column(UUID(as_uuid=True), ForeignKey("profiles.id",      ondelete="CASCADE"), nullable=False)
+    parent_id  = Column(UUID(as_uuid=True), ForeignKey("post_comments.id", ondelete="CASCADE"))
+    content    = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    post       = relationship("FeedPost", back_populates="comments")
+
+
+class PostReaction(Base):
+    __tablename__ = "post_reactions"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    post_id    = Column(UUID(as_uuid=True), ForeignKey("feed_posts.id", ondelete="CASCADE"), nullable=False)
+    user_id    = Column(UUID(as_uuid=True), ForeignKey("profiles.id",   ondelete="CASCADE"), nullable=False)
+    # like | hype | respect | strong | skill
+    reaction   = Column(String, nullable=False, default="like")
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    post       = relationship("FeedPost", back_populates="reactions")
 
 
 class GeographicData(Base):

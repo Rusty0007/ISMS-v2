@@ -3,17 +3,24 @@ System Administration Routes
 All endpoints require the `system_admin` role.
 """
 
+import logging
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.middleware.auth import require_role
 from app.models.models import (
-    Match, Profile, SecurityAuditLog, Tournament,
+    Court, Match, MatchHistory, Profile, SecurityAuditLog, Tournament,
     TournamentRegistration, UserRole, UserRoleModel,
 )
+from app.services.broadcast import broadcast_match as _broadcast
+from app.services.rating_rebuilder import rebuild_all_ratings_from_history
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -84,7 +91,7 @@ def list_users(
     if q:
         like = f"%{q}%"
         query = query.filter(
-            (Profile.username.ilike(like)) | (Profile.email.ilike(like))
+            Profile.first_name.ilike(like) | Profile.last_name.ilike(like) | Profile.email.ilike(like)
         )
 
     total = query.count()
@@ -103,9 +110,8 @@ def list_users(
             for r in u.roles
         ]
         result.append({
-            "id":         str(u.id),
-            "username":   u.username,
-            "email":      u.email,
+            "id":    str(u.id),
+            "email": u.email,
             "first_name": u.first_name,
             "last_name":  u.last_name,
             "avatar_url": u.avatar_url,
@@ -205,7 +211,7 @@ def list_all_tournaments(
             "sport":       t.sport.value if hasattr(t.sport, "value") else str(t.sport),
             "status":      t.status,
             "format":      t.format,
-            "organizer":   organizer.username if organizer else None,
+            "organizer":   f"{organizer.first_name or ''} {organizer.last_name or ''}".strip() if organizer else None,
             "organizer_id": str(t.organizer_id),
             "participants": participant_count,
             "max_players": t.max_participants,
@@ -256,21 +262,20 @@ def list_audit_logs(
         .all()
     )
 
-    # Fetch usernames in one shot
     user_ids = list({str(l.user_id) for l in logs if l.user_id})
     profiles = (
-        db.query(Profile.id, Profile.username)
+        db.query(Profile.id, Profile.first_name, Profile.last_name)
         .filter(Profile.id.in_(user_ids))
         .all()
     ) if user_ids else []
-    username_map = {str(p.id): p.username for p in profiles}
+    name_map = {str(p.id): f"{p.first_name or ''} {p.last_name or ''}".strip() for p in profiles}
 
     return {
         "logs": [
             {
                 "id":         str(l.id),
                 "user_id":    str(l.user_id),
-                "username":   username_map.get(str(l.user_id), "unknown"),
+                "name":       name_map.get(str(l.user_id), "unknown"),
                 "event_type": l.event_type,
                 "ip_address": l.ip_address,
                 "details":    l.details,
@@ -282,3 +287,80 @@ def list_audit_logs(
         "page":  page,
         "limit": limit,
     }
+
+
+# ── Stuck Match Recovery ──────────────────────────────────────────────────────
+
+class ForceCompleteRequest(BaseModel):
+    winner_id: str
+    reason: str = "admin_force_complete"
+
+
+@router.post("/matches/{match_id}/force-complete")
+def admin_force_complete_match(
+    match_id: str,
+    body: ForceCompleteRequest,
+    current_admin: dict = _admin,
+    db: Session = Depends(get_db),
+):
+    """
+    Force a stuck 'ongoing' match to 'completed' without running Glicko-2
+    or the stored procedure. Use when fn_complete_match() has failed and the
+    match is permanently stuck. Ratings are NOT updated — this is a recovery tool.
+    """
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found.")
+
+    status_val = match.status.value if hasattr(match.status, "value") else str(match.status)
+    if status_val == "completed":
+        raise HTTPException(status_code=400, detail="Match is already completed.")
+
+    setattr(match, "status", "completed")
+    setattr(match, "winner_id", body.winner_id)
+    setattr(match, "completed_at", datetime.now(timezone.utc))
+
+    # Release the court if one was held
+    if match.court_id is not None:
+        court = db.query(Court).filter(Court.id == match.court_id).first()
+        if court:
+            setattr(court, "status", "available")
+
+    db.add(MatchHistory(
+        match_id=match_id,
+        event_type="admin_force_complete",
+        recorded_by=current_admin["id"],
+        description=f"Admin force-completed match. Reason: {body.reason}. Ratings NOT updated.",
+        meta={"winner_id": body.winner_id, "admin_id": current_admin["id"], "reason": body.reason},
+    ))
+    db.commit()
+
+    _broadcast(match_id, {"type": "match_completed", "winner_id": body.winner_id, "forced": True})
+    logger.warning(
+        f"[admin] Match {match_id} force-completed by admin {current_admin['id']}. "
+        f"Winner: {body.winner_id}. Reason: {body.reason}"
+    )
+    return {"message": "Match force-completed. Ratings were NOT updated.", "match_id": match_id}
+
+
+@router.post("/ratings/rebuild")
+def admin_rebuild_ratings(
+    current_admin: dict = _admin,
+    db: Session = Depends(get_db),
+):
+    """
+    Rebuild all player ratings and win/loss records from completed match history.
+    Use this after rating formula fixes or data repair.
+    """
+    try:
+        summary = rebuild_all_ratings_from_history(db)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.exception("[admin] Rating rebuild failed")
+        raise HTTPException(status_code=500, detail=f"Rating rebuild failed: {exc}")
+
+    logger.warning(
+        f"[admin] Ratings rebuilt from history by admin {current_admin['id']}: {summary.to_dict()}"
+    )
+    return {"message": "Ratings rebuilt from completed match history.", "summary": summary.to_dict()}
