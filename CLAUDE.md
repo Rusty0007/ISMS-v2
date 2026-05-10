@@ -15,9 +15,9 @@ docker compose up -d
 
 ### Rebuild a single service after code changes
 ```powershell
-# PowerShell (Windows)
-docker compose build --no-cache frontend; docker compose up -d frontend
-docker compose build --no-cache backend; docker compose up -d backend
+# PowerShell (Windows) — always use --remove-orphans to prevent naming conflicts
+docker compose build frontend; docker compose down frontend; docker compose up -d --remove-orphans frontend
+docker compose build backend; docker compose down backend; docker compose up -d --remove-orphans backend
 ```
 
 ### Frontend dev server (outside Docker)

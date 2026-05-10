@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from sqlalchemy.orm import Session
@@ -29,6 +30,19 @@ def _publish_notif(user_id: str) -> None:
         _redis_notif.publish(f"{_NOTIF_PREFIX}{user_id}", "new")
     except Exception as e:
         logger.warning(f"[notifications] Redis publish failed for {user_id}: {e}")
+
+
+def publish_feed_unread(user_id: str, count: int) -> None:
+    """Push the current feed unread count to the user's SSE stream."""
+    if _redis_notif is None:
+        return
+    try:
+        _redis_notif.publish(
+            f"{_NOTIF_PREFIX}{user_id}",
+            json.dumps({"type": "feed_unread_count", "count": count}),
+        )
+    except Exception as e:
+        logger.warning(f"[notifications] feed_unread_count publish failed for {user_id}: {e}")
 
 # ── Firebase Admin SDK (optional — only initialised if credentials file exists) ─
 _fcm_ready = False
@@ -122,6 +136,13 @@ def send_notification(
         fcm_token = str(profile.fcm_token) if profile and profile.fcm_token is not None else None
         if fcm_token:
             _send_fcm(fcm_token, title, body, notif_type, reference_id, extra_data)
+
+        # SMS — only for time-critical event types, only if player opted in
+        try:
+            from app.tasks.sms import maybe_send_sms
+            maybe_send_sms(user_id, body, notif_type)
+        except Exception as sms_exc:
+            logger.warning(f"[sms] Failed to enqueue SMS for {user_id}: {sms_exc}")
 
     except Exception as e:
         if not committed:

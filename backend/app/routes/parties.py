@@ -10,6 +10,8 @@ Flow:
   6. POST /parties/{id}/disband → cancels the party and any active queue entry.
 """
 
+# pyright: reportGeneralTypeIssues=false, reportAttributeAccessIssue=false, reportArgumentType=false
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -23,6 +25,7 @@ from app.models.models import ClubMember, Match, MatchLobbyPlayer, Party, PartyI
 from app.middleware.auth import get_current_user
 from app.services.matchmaking import (
     can_join_doubles_lobby,
+    is_geo_pool_compatible,
     is_mixed_doubles_team,
     normalize_gender,
     score_doubles_entry,
@@ -645,6 +648,7 @@ def party_join_queue(
             match_format=party.match_format,
             status="assembling",
             club_id=preferred_club_id,
+            best_of=1,
             team1_player1=p1_id,
             team1_player2=p2_id,
             player1_id=p1_id,
@@ -714,6 +718,15 @@ def party_join_queue(
             if team_score <= 0.0:
                 return queue_party_without_match(
                     "Your duo is queued and still searching for a compatible opponent team.",
+                )
+        else:
+            # Geo gate for normal-mode party matching — enforce same-province proximity
+            t1_stats = _team_stats(db, [pid for pid in [team1_p1, team1_p2] if pid], party.sport, party.match_format)
+            my_stats = _team_stats(db, [p1_id, p2_id], party.sport, party.match_format)
+            geo_ok, _, _ = is_geo_pool_compatible(t1_stats + my_stats, "quick", 0)
+            if not geo_ok:
+                return queue_party_without_match(
+                    "Your duo is queued and searching for a nearby opponent team.",
                 )
 
         # Fill team 2
@@ -806,6 +819,7 @@ def party_join_queue(
         match_format=party.match_format,
         status="assembling",
         club_id=preferred_club_id,
+        best_of=1,
         team1_player1=p1_id,
         team1_player2=p2_id,
         player1_id=p1_id,
@@ -885,6 +899,80 @@ def party_leave_queue(
     return _party_response(party, db)
 
 
+@router.post("/parties/{party_id}/abandon-solo")
+def abandon_solo_party(
+    party_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disband an empty, auto-created party shell when the creator leaves the page."""
+    user_id = current_user["id"]
+    party = db.query(Party).filter(Party.id == party_id).first()
+    if not party:
+        return {"message": "Party already gone"}
+    if str(party.leader_id) != user_id:
+        raise HTTPException(403, "Only the party leader can abandon this lobby")
+
+    pending_invites = [inv for inv in party.invitations if inv.status == "pending"]
+    if party.status != "forming" or len(party.members) != 1 or pending_invites:
+        raise HTTPException(400, "Only an empty forming lobby can be abandoned automatically")
+
+    party.status = "disbanded"
+    db.commit()
+    return {"message": "Solo party abandoned"}
+
+
+@router.post("/parties/{party_id}/leave")
+def leave_party(
+    party_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Allow an invited member to leave a hosted party without disbanding the leader's lobby."""
+    user_id = current_user["id"]
+    party = db.query(Party).filter(Party.id == party_id).first()
+    if not party:
+        raise HTTPException(404, "Party not found")
+    if str(party.leader_id) == user_id:
+        raise HTTPException(400, "Party leaders must disband the lobby instead")
+    if party.status not in ("ready", "forming"):
+        raise HTTPException(400, "You cannot leave after the party has entered queue")
+
+    membership = (
+        db.query(PartyMember)
+        .filter(PartyMember.party_id == party.id, PartyMember.user_id == user_id)
+        .first()
+    )
+    if not membership:
+        raise HTTPException(403, "You are not in this party")
+
+    db.delete(membership)
+    party.status = "forming"
+    party.match_id = None
+    setattr(party, "queue_started_at", None)
+
+    for inv in party.invitations:
+        if str(inv.invitee_id) == user_id and inv.status == "accepted":
+            inv.status = "left"
+
+    leader = db.query(Profile).filter(Profile.id == party.leader_id).first()
+    leaver = db.query(Profile).filter(Profile.id == user_id).first()
+    leaver_name = "Your partner"
+    if leaver:
+        leaver_name = f"{leaver.first_name or ''} {leaver.last_name or ''}".strip() or "Your partner"
+    if leader:
+        send_notification(
+            user_id=str(party.leader_id),
+            title="Party Member Left",
+            body=f"{leaver_name} left your party lobby.",
+            notif_type="party_member_left",
+            reference_id=str(party.id),
+        )
+
+    db.commit()
+    return {"message": "You left the party"}
+
+
 @router.post("/parties/{party_id}/disband")
 def disband_party(
     party_id: str,
@@ -901,6 +989,8 @@ def disband_party(
     member_ids = [str(m.user_id) for m in party.members]
     if user_id not in member_ids:
         raise HTTPException(403, "You are not in this party")
+    if str(party.leader_id) != user_id:
+        raise HTTPException(403, "Only the party leader can disband this lobby")
 
     # Cancel queue entry if active
     if party.match_id and party.status == "in_queue":

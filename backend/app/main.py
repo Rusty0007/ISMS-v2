@@ -132,11 +132,28 @@ def _run_column_migrations():
         """))
         # profiles — gender
         conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS gender TEXT"))
+        # profiles — SMS notifications
+        conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS phone_number TEXT"))
+        conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS sms_notifications_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN NOT NULL DEFAULT FALSE"))
+        # club check-ins (used by courts/live endpoint)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS club_checkins (
+                id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id        UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                club_id        UUID NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+                status         TEXT NOT NULL DEFAULT 'present',
+                checked_in_at  TIMESTAMPTZ DEFAULT NOW(),
+                checked_out_at TIMESTAMPTZ
+            )
+        """))
         # court_bookings — rental support
         conn.execute(text("ALTER TABLE court_bookings ADD COLUMN IF NOT EXISTS booking_type TEXT DEFAULT 'match'"))
         conn.execute(text("ALTER TABLE court_bookings ADD COLUMN IF NOT EXISTS duration_hours NUMERIC DEFAULT 1"))
         # courts — rental pricing
         conn.execute(text("ALTER TABLE courts ADD COLUMN IF NOT EXISTS price_per_hour NUMERIC"))
+        # courts — role: 'any' | 'rental' | 'open_play'
+        conn.execute(text("ALTER TABLE courts ADD COLUMN IF NOT EXISTS court_role TEXT NOT NULL DEFAULT 'any'"))
         # clubs — cover image
         conn.execute(text("ALTER TABLE clubs ADD COLUMN IF NOT EXISTS cover_url TEXT"))
         # courts — image, creator, location, standalone support
@@ -156,14 +173,37 @@ def _run_column_migrations():
         conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS knockout_best_of INTEGER NOT NULL DEFAULT 3"))
         # tournaments — group stage / pool / round-robin / swiss per-match best-of
         conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS group_stage_best_of INTEGER NOT NULL DEFAULT 1"))
+        # tournaments — mode: casual (no rating impact) | ranked | championship
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS tournament_mode TEXT NOT NULL DEFAULT 'ranked'"))
+        # tournaments — generate a 3rd-place match in single/double elimination
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS third_place_match BOOLEAN NOT NULL DEFAULT FALSE"))
+        # matches — per-player rating deltas stored at completion for match history display
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS rating_changes JSONB"))
+        # tournaments — wildcard spots from non-advancing pool players into knockout
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS wildcard_count INTEGER NOT NULL DEFAULT 0"))
+        # tournaments — court count and estimated match duration for schedule warnings
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS court_count INTEGER"))
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS match_duration_minutes INTEGER NOT NULL DEFAULT 30"))
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS access_type TEXT NOT NULL DEFAULT 'open'"))
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS exclusive_scope TEXT NOT NULL DEFAULT 'city'"))
         conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS venue_mode TEXT NOT NULL DEFAULT 'tbd'"))
         conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS venue_name TEXT"))
         conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS venue_address TEXT"))
+        conn.execute(text("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS city_mun_code TEXT"))
         conn.execute(text("""
             UPDATE tournaments
             SET venue_mode = 'club'
             WHERE club_id IS NOT NULL
               AND (venue_mode IS NULL OR venue_mode = 'tbd')
+        """))
+        conn.execute(text("""
+            UPDATE tournaments AS t
+            SET region_code = COALESCE(t.region_code, c.region_code),
+                province_code = COALESCE(t.province_code, c.province_code),
+                city_mun_code = COALESCE(t.city_mun_code, c.city_mun_code)
+            FROM clubs AS c
+            WHERE t.club_id = c.id
+              AND (t.region_code IS NULL OR t.province_code IS NULL OR t.city_mun_code IS NULL)
         """))
         # open play sessions — live operations settings
         conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS match_format TEXT NOT NULL DEFAULT 'doubles'"))
@@ -238,6 +278,24 @@ def _run_column_migrations():
         conn.execute(text("ALTER TABLE open_play_session_courts ADD COLUMN IF NOT EXISTS max_consecutive_wins INTEGER"))
         conn.execute(text("ALTER TABLE open_play_assignments ADD COLUMN IF NOT EXISTS side1_score INTEGER"))
         conn.execute(text("ALTER TABLE open_play_assignments ADD COLUMN IF NOT EXISTS side2_score INTEGER"))
+        # open play — warm-up timer (0 = disabled)
+        conn.execute(text("ALTER TABLE open_play_sessions ADD COLUMN IF NOT EXISTS warm_up_duration_seconds INTEGER NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE open_play_assignments ADD COLUMN IF NOT EXISTS warmup_started_at TIMESTAMPTZ"))
+        # open play — pre-session check-in
+        conn.execute(text("ALTER TABLE open_play_participants ADD COLUMN IF NOT EXISTS checked_in BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE open_play_participants ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE open_play_participants ADD COLUMN IF NOT EXISTS checkin_reminder_sent BOOLEAN NOT NULL DEFAULT FALSE"))
+        # open play — court manager delegation
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS open_play_court_managers (
+                id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                session_court_id UUID NOT NULL REFERENCES open_play_session_courts(id) ON DELETE CASCADE,
+                user_id          UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                assigned_by      UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                assigned_at      TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (session_court_id, user_id)
+            )
+        """))
         conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS party_id UUID REFERENCES parties(id)"))
         # matches — per-match score limit override
         conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS score_limit INTEGER"))
@@ -342,6 +400,20 @@ def _run_column_migrations():
         conn.execute(text("""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_post_reactions_post_user
             ON post_reactions (post_id, user_id)
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS feed_notifications (
+                id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id    UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                post_id    UUID NOT NULL REFERENCES feed_posts(id) ON DELETE CASCADE,
+                is_read    BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (user_id, post_id)
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_feed_notifications_user_unread
+            ON feed_notifications (user_id) WHERE is_read = FALSE
         """))
         conn.execute(text("ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS team_name TEXT"))
         conn.execute(text("""
@@ -823,6 +895,57 @@ async def httpx_read_error_handler(request, exc):
         status_code=503,
         content={"detail": "Service temporarily unavailable. Please retry"}
     )
+
+
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from sqlalchemy.exc import OperationalError, IntegrityError
+import asyncio as _asyncio
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    messages = []
+    for e in errors:
+        field = " → ".join(str(loc) for loc in e["loc"] if loc != "body")
+        msg   = e["msg"].replace("Value error, ", "")
+        messages.append(f"{field}: {msg}" if field else msg)
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "; ".join(messages) if messages else "Invalid request data."},
+    )
+
+
+@app.exception_handler(OperationalError)
+async def db_operational_error_handler(request: Request, exc: OperationalError):
+    logger.error(f"[db] OperationalError on {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "The database is temporarily unavailable. Please try again in a moment."},
+    )
+
+
+@app.exception_handler(IntegrityError)
+async def db_integrity_error_handler(request: Request, exc: IntegrityError):
+    logger.warning(f"[db] IntegrityError on {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "This action conflicts with existing data. The record may already exist."},
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    if isinstance(exc, (_asyncio.CancelledError, KeyboardInterrupt)):
+        raise exc
+    logger.exception(f"[unhandled] {request.method} {request.url.path}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred. Our team has been notified."},
+    )
+
+
 
 
 async def _tournament_reminder_loop():

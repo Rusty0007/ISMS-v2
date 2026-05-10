@@ -1,6 +1,10 @@
+import json
+import logging
+
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from app.config import settings
 from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models.models import Profile
@@ -12,7 +16,20 @@ from app.services.rating_policy import (
 )
 from app.utils.skill_tiers import SKILL_TIER_DEFINITIONS
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_LEADERBOARD_TTL = 30  # seconds — leaderboard cache lifetime
+
+
+def _get_redis():
+    try:
+        import redis as _redis_lib
+        r = _redis_lib.from_url(settings.redis_url, decode_responses=True, socket_timeout=1)
+        r.ping()
+        return r
+    except Exception:
+        return None
 
 TIER_ORDER = [tier.name for tier in SKILL_TIER_DEFINITIONS]
 
@@ -20,20 +37,29 @@ TIER_ORDER = [tier.name for tier in SKILL_TIER_DEFINITIONS]
 _LEVEL_SLUGS = {tier.slug: tier.name for tier in SKILL_TIER_DEFINITIONS}
 
 
-NATIONAL_MIN_RATING   = 1900  # Minimum rating to appear on National leaderboard
+NATIONAL_MIN_RATING   = 2300.0  # Minimum rating to appear on National leaderboard
 NATIONAL_MIN_MATCHES  = LEADERBOARD_MIN_MATCHES
+
+# Minimum rating required per geographic level — follows the ISMS tier ladder.
+GEO_LEVEL_MIN_RATINGS: dict[str, float] = {
+    "barangay":  1500.0,   # Barangay tier (1500–1699)
+    "city":      1700.0,   # City tier (1700–1899)
+    "provincial": 1900.0,  # Provincial tier (1900–2099)
+    "regional":  2100.0,   # Regional tier (2100–2299)
+    "national":  2300.0,   # National tier (2300+)
+}
 
 
 def _build_filters(sport: str, match_format: str, geo_level: str, profile: Profile | None):
     """Return WHERE clause filters and params for leaderboard_view."""
     # Only officially rated (calibration complete) players appear on public leaderboards
     filters = [
-        "sport::TEXT = :sport",
-        "match_format::TEXT = :match_format",
-        "is_leaderboard_eligible = TRUE",
-        "matches_played >= :leaderboard_min_matches",
-        "distinct_opponents_count >= :leaderboard_min_opponents",
-        "rating_deviation <= :leaderboard_rd_threshold",
+        "lv.sport::TEXT = :sport",
+        "lv.match_format::TEXT = :match_format",
+        "lv.is_leaderboard_eligible = TRUE",
+        "lv.matches_played >= :leaderboard_min_matches",
+        "lv.distinct_opponents_count >= :leaderboard_min_opponents",
+        "lv.rating_deviation <= :leaderboard_rd_threshold",
     ]
     params: dict = {
         "sport": sport,
@@ -43,23 +69,26 @@ def _build_filters(sport: str, match_format: str, geo_level: str, profile: Profi
         "leaderboard_rd_threshold": LEADERBOARD_RD_THRESHOLD,
     }
 
+    # Apply the minimum rating gate for this geographic level
+    min_rating = GEO_LEVEL_MIN_RATINGS.get(geo_level, 500.0)
+    if min_rating > 500.0:
+        filters.append("lv.rating >= :geo_min_rating")
+        params["geo_min_rating"] = min_rating
+
     if geo_level == "national":
-        # National board is exclusive — requires minimum rating + match count
-        filters.append("rating >= :nat_min_rating")
-        filters.append("matches_played >= :nat_min_matches")
-        params["nat_min_rating"]  = NATIONAL_MIN_RATING
+        filters.append("lv.matches_played >= :nat_min_matches")
         params["nat_min_matches"] = NATIONAL_MIN_MATCHES
     elif geo_level == "regional" and profile is not None and profile.region_code is not None:
-        filters.append("region_code = :region_code")
+        filters.append("lv.region_code = :region_code")
         params["region_code"] = profile.region_code
     elif geo_level == "provincial" and profile is not None and profile.province_code is not None:
-        filters.append("province_code = :province_code")
+        filters.append("lv.province_code = :province_code")
         params["province_code"] = profile.province_code
     elif geo_level == "city" and profile is not None and profile.city_mun_code is not None:
-        filters.append("city_mun_code = :city_mun_code")
+        filters.append("lv.city_mun_code = :city_mun_code")
         params["city_mun_code"] = profile.city_mun_code
     elif geo_level == "barangay" and profile is not None and profile.barangay_code is not None:
-        filters.append("barangay_code = :barangay_code")
+        filters.append("lv.barangay_code = :barangay_code")
         params["barangay_code"] = profile.barangay_code
 
     return " AND ".join(filters), params
@@ -78,19 +107,46 @@ def get_leaderboard(
     user_id = current_user["id"]
     profile = db.query(Profile).filter(Profile.id == user_id).first()
 
+    # Build geo code suffix for cache key (national has no geo restriction)
+    geo_code = ""
+    if geo_level == "regional"   and profile and profile.region_code:    geo_code = profile.region_code
+    elif geo_level == "provincial" and profile and profile.province_code: geo_code = profile.province_code
+    elif geo_level == "city"       and profile and profile.city_mun_code: geo_code = profile.city_mun_code
+    elif geo_level == "barangay"   and profile and profile.barangay_code: geo_code = profile.barangay_code
+
+    cache_key = f"lb:{sport}:{match_format}:{geo_level}:{geo_code}:{offset}:{limit}"
+    redis = _get_redis()
+    if redis:
+        try:
+            cached = redis.get(cache_key)
+            if cached:
+                payload = json.loads(cached)
+                # Re-stamp is_me and my_rank per user (not cached)
+                for entry in payload.get("leaderboard", []):
+                    entry["is_me"] = entry["user_id"] == user_id
+                payload["my_rank"] = next(
+                    (e["rank"] for e in payload["leaderboard"] if e["is_me"]), None
+                ) or payload.get("my_rank")
+                return payload
+        except Exception:
+            pass
+
     where, params = _build_filters(sport, match_format, geo_level, profile)
 
-    # Ranked query with window function
+    # Ranked query with window function — join profiles for avatar_url
     sql = text(f"""
         SELECT
-            ROW_NUMBER() OVER (ORDER BY rating DESC, wins DESC) AS rank,
-            user_id, username, first_name, last_name,
-            region_code, province_code, city_mun_code,
-            rating, rating_deviation, wins, losses, matches_played,
-            distinct_opponents_count, current_win_streak, win_rate_pct, skill_tier, activeness_score
-        FROM leaderboard_view
+            ROW_NUMBER() OVER (ORDER BY lv.rating DESC, lv.wins DESC) AS rank,
+            lv.user_id, lv.first_name, lv.last_name,
+            p.avatar_url,
+            lv.region_code, lv.province_code, lv.city_mun_code,
+            lv.rating, lv.rating_deviation, lv.wins, lv.losses, lv.matches_played,
+            lv.distinct_opponents_count, lv.current_win_streak, lv.win_rate_pct,
+            lv.skill_tier, lv.activeness_score
+        FROM leaderboard_view lv
+        LEFT JOIN profiles p ON p.id = lv.user_id
         WHERE {where}
-        ORDER BY rating DESC, wins DESC
+        ORDER BY lv.rating DESC, lv.wins DESC
         LIMIT :limit OFFSET :offset
     """)
     params["limit"]  = limit
@@ -104,10 +160,10 @@ def get_leaderboard(
         entry = {
             "rank":             int(row["rank"]),
             "user_id":          str(row["user_id"]),
-            "username":         row["username"],
             "first_name":       row["first_name"],
             "last_name":        row["last_name"],
-            "rating":           round(float(row["rating"]), 1) if row["rating"] else 1500.0,
+            "avatar_url":       row["avatar_url"],
+            "rating":           round(float(row["rating"])) if row["rating"] else 1500,
             "rating_deviation": round(float(row["rating_deviation"]), 1) if row["rating_deviation"] else 350.0,
             "wins":             row["wins"] or 0,
             "losses":           row["losses"] or 0,
@@ -127,7 +183,7 @@ def get_leaderboard(
         result.append(entry)
 
     # Count total for this filter
-    count_sql = text(f"SELECT COUNT(*) FROM leaderboard_view WHERE {where}")
+    count_sql = text(f"SELECT COUNT(*) FROM leaderboard_view lv LEFT JOIN profiles p ON p.id = lv.user_id WHERE {where}")
     count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
     total = db.execute(count_sql, count_params).scalar() or 0
 
@@ -137,9 +193,10 @@ def get_leaderboard(
         rank_sql = text(f"""
             SELECT sub.rank FROM (
                 SELECT
-                    user_id,
-                    ROW_NUMBER() OVER (ORDER BY rating DESC, wins DESC) AS rank
-                FROM leaderboard_view
+                    lv.user_id,
+                    ROW_NUMBER() OVER (ORDER BY lv.rating DESC, lv.wins DESC) AS rank
+                FROM leaderboard_view lv
+                LEFT JOIN profiles p ON p.id = lv.user_id
                 WHERE {where}
             ) sub
             WHERE sub.user_id = :me_id
@@ -149,7 +206,7 @@ def get_leaderboard(
         if my_rank_row:
             my_rank = int(my_rank_row[0])
 
-    return {
+    payload = {
         "leaderboard":  result,
         "total":        int(total),
         "offset":       offset,
@@ -159,6 +216,12 @@ def get_leaderboard(
         "match_format": match_format,
         "geo_level":    geo_level,
     }
+    if redis:
+        try:
+            redis.setex(cache_key, _LEADERBOARD_TTL, json.dumps(payload))
+        except Exception:
+            pass
+    return payload
 
 
 @router.get("/competitive")
@@ -279,7 +342,7 @@ def get_competitive_leaderboard(
             "user_id":            str(row["user_id"]),
             "first_name":         row["first_name"],
             "last_name":          row["last_name"],
-            "rating":             round(float(row["rating"]), 1) if row["rating"] else 1500.0,
+            "rating":             round(float(row["rating"])) if row["rating"] else 1500,
             "rating_deviation":   round(float(row["rating_deviation"]), 1) if row["rating_deviation"] else 350.0,
             "wins":               row["wins"] or 0,
             "losses":             row["losses"] or 0,

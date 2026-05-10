@@ -1,3 +1,4 @@
+
 """
 Seed script — grants system_admin role to an existing ISMS user.
 

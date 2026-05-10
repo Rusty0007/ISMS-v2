@@ -14,23 +14,26 @@ router = APIRouter()
 # ── Request models ────────────────────────────────────────
 
 class CreateCourtRequest(BaseModel):
-    name:      str
-    sport:     Optional[str] = None
-    surface:   Optional[str] = None   # e.g. Wooden, Clay, Acrylic, Concrete, Modular Tiles
-    is_indoor: Optional[bool] = True
-    lighting:  Optional[str] = "good" # good | fair | poor
-    capacity:  Optional[int] = None
-    notes:     Optional[str] = None
+    name:        str
+    sport:       Optional[str]  = None
+    surface:     Optional[str]  = None   # e.g. Wooden, Clay, Acrylic, Concrete, Modular Tiles
+    is_indoor:   Optional[bool] = True
+    lighting:    Optional[str]  = "good" # good | fair | poor
+    capacity:    Optional[int]  = None
+    notes:       Optional[str]  = None
+    court_role:  Optional[str]  = "any"  # any | rental | open_play
 
 class UpdateCourtRequest(BaseModel):
-    name:      Optional[str] = None
-    sport:     Optional[str] = None
-    surface:   Optional[str] = None
-    is_indoor: Optional[bool] = None
-    lighting:  Optional[str] = None
-    capacity:  Optional[int] = None
-    notes:     Optional[str] = None
-    status:    Optional[str] = None  # 'available' | 'reserved' | 'maintenance'
+    name:        Optional[str]  = None
+    sport:       Optional[str]  = None
+    surface:     Optional[str]  = None
+    is_indoor:   Optional[bool] = None
+    lighting:    Optional[str]  = None
+    capacity:    Optional[int]  = None
+    notes:       Optional[str]  = None
+    status:      Optional[str]  = None   # 'available' | 'reserved' | 'maintenance'
+    court_role:  Optional[str]  = None   # any | rental | open_play
+    price_per_hour: Optional[float] = None
 
 class BookCourtRequest(BaseModel):
     match_id:     str
@@ -41,6 +44,32 @@ class RentCourtRequest(BaseModel):
     scheduled_at:   datetime
     duration_hours: Optional[float] = 1.0
     notes:          Optional[str] = None
+
+
+def _serialize_court(c: Court, club_name: str | None = None) -> dict:
+    """Serialize a court (club-owned or standalone) with all public fields."""
+    raw_pph = getattr(c, "price_per_hour", None)
+    return {
+        "id":             str(c.id),
+        "name":           c.name,
+        "sport":          c.sport,
+        "surface":        c.surface,
+        "is_indoor":      c.is_indoor,
+        "lighting":       c.lighting,
+        "capacity":       c.capacity,
+        "notes":          c.notes,
+        "status":         c.status,
+        "image_url":      getattr(c, "image_url", None),
+        "address":        getattr(c, "address", None),
+        "region_code":    getattr(c, "region_code", None),
+        "province_code":  getattr(c, "province_code", None),
+        "city_mun_code":  getattr(c, "city_mun_code", None),
+        "price_per_hour": float(raw_pph) if raw_pph is not None else None,
+        "court_role":     getattr(c, "court_role", "any") or "any",
+        "club_id":        str(c.club_id) if c.club_id is not None else None,
+        "club_name":      club_name,
+        "created_by":     str(c.created_by) if getattr(c, "created_by", None) else None,
+    }
 
 
 # ══════════════════════════════════════════════════════════
@@ -73,15 +102,12 @@ def create_court(
         notes=data.notes,
         status="available",
     )
+    setattr(court, "court_role",    data.court_role or "any")
+    setattr(court, "price_per_hour", None)
     db.add(court)
     db.commit()
 
-    return {"message": "Court created.", "court": {
-        "id": str(court.id), "name": court.name, "sport": court.sport,
-        "surface": court.surface, "is_indoor": court.is_indoor,
-        "lighting": court.lighting, "capacity": court.capacity, "status": court.status,
-        "image_url": getattr(court, "image_url", None),
-    }}
+    return {"message": "Court created.", "court": _serialize_court(court)}
 
 
 @router.get("/clubs/{club_id}/courts")
@@ -92,16 +118,7 @@ def get_club_courts(
 ):
     courts = db.query(Court).filter(Court.club_id == club_id).order_by(Court.name).all()
 
-    return {"courts": [
-        {
-            "id": str(c.id), "name": c.name, "sport": c.sport,
-            "surface": c.surface, "is_indoor": c.is_indoor,
-            "lighting": c.lighting, "capacity": c.capacity,
-            "notes": c.notes, "status": c.status,
-            "image_url": getattr(c, "image_url", None),
-        }
-        for c in courts
-    ]}
+    return {"courts": [_serialize_court(c) for c in courts]}
 
 
 @router.put("/clubs/{club_id}/courts/{court_id}")
@@ -679,6 +696,124 @@ def list_standalone_courts(
         query = query.filter(Court.name.ilike(f"%{q}%"))
     courts = query.order_by(Court.created_at.desc()).all()
     return {"courts": [_serialize_standalone(c) for c in courts]}
+
+
+# ── Court Discovery (clubs + standalone, public) ──────────────────────────────
+
+@router.get("/courts/discover")
+def discover_courts(
+    sport:   Optional[str]  = None,
+    date:    Optional[str]  = None,   # YYYY-MM-DD; used to compute slot counts
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Public discovery endpoint for court rental.
+    Returns clubs that have at least one rentable court, grouped by club,
+    plus standalone courts — all filterable by sport.
+    Requires auth so we can compute the user's location for future geo sorting.
+    """
+    query_date: date_type | None = None
+    if date:
+        try:
+            query_date = date_type.fromisoformat(date)
+        except ValueError:
+            pass
+
+    # ── Club courts ───────────────────────────────────────────────────────────
+    court_q = (
+        db.query(Court)
+        .filter(
+            Court.club_id.isnot(None),
+            Court.status != "maintenance",
+        )
+    )
+    if sport:
+        court_q = court_q.filter(Court.sport == sport)
+
+    club_courts = court_q.order_by(Court.name).all()
+
+    # Group courts by club_id
+    from collections import defaultdict
+    courts_by_club: dict = defaultdict(list)
+    club_ids: set = set()
+    for c in club_courts:
+        role = getattr(c, "court_role", "any") or "any"
+        if role in ("any", "rental"):
+            courts_by_club[str(c.club_id)].append(c)
+            club_ids.add(str(c.club_id))
+
+    # Batch-load clubs
+    clubs_map: dict = {}
+    if club_ids:
+        for cl in db.query(Club).filter(Club.id.in_(club_ids)).all():
+            clubs_map[str(cl.id)] = cl
+
+    # Compute booked slots per court for query_date
+    def _available_count(court_id: str) -> int:
+        if not query_date:
+            return -1  # unknown
+        day_start = datetime(query_date.year, query_date.month, query_date.day, 6, 0, tzinfo=timezone.utc)
+        day_end   = datetime(query_date.year, query_date.month, query_date.day, 22, 0, tzinfo=timezone.utc)
+        total_slots = 16
+        booked = db.query(func.count(CourtBooking.id)).filter(
+            CourtBooking.court_id == court_id,
+            CourtBooking.status.in_(["pending_approval", "approved"]),
+            CourtBooking.scheduled_at >= day_start,
+            CourtBooking.scheduled_at < day_end,
+        ).scalar() or 0
+        return max(0, total_slots - int(booked))
+
+    club_results = []
+    for club_id_str, cts in courts_by_club.items():
+        cl = clubs_map.get(club_id_str)
+        if not cl:
+            continue
+        cl_sport = cl.sport.value if hasattr(cl.sport, "value") else str(cl.sport or "")
+        if sport and cl_sport != sport:
+            continue
+        club_results.append({
+            "club_id":        club_id_str,
+            "club_name":      cl.name,
+            "club_sport":     cl_sport,
+            "logo_url":       cl.logo_url if getattr(cl, "logo_url", None) else None,
+            "cover_url":      getattr(cl, "cover_url", None),
+            "address":        getattr(cl, "address", None),
+            "opening_time":   getattr(cl, "opening_time", "06:00"),
+            "closing_time":   getattr(cl, "closing_time", "22:00"),
+            "courts": [
+                {
+                    **_serialize_court(c, cl.name),
+                    "available_slots": _available_count(str(c.id)),
+                }
+                for c in cts
+            ],
+        })
+
+    # ── Standalone courts ─────────────────────────────────────────────────────
+    sa_q = db.query(Court).filter(
+        Court.club_id.is_(None),
+        Court.status != "maintenance",
+    )
+    if sport:
+        sa_q = sa_q.filter(Court.sport == sport)
+
+    standalone = []
+    for c in sa_q.order_by(Court.created_at.desc()).all():
+        role = getattr(c, "court_role", "any") or "any"
+        if role not in ("any", "rental"):
+            continue
+        standalone.append({
+            **_serialize_standalone(c),
+            "available_slots": _available_count(str(c.id)),
+        })
+
+    return {
+        "clubs":      club_results,
+        "standalone": standalone,
+        "date":       date,
+        "sport":      sport,
+    }
 
 
 @router.get("/courts/my-bookings")

@@ -1,8 +1,14 @@
 import unittest
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import app.services.matchmaking as matchmaking
-from app.services.matchmaking import can_join_doubles_lobby, is_mixed_doubles_team, run_matchmaking
+from app.services.matchmaking import (
+    can_join_doubles_lobby,
+    find_best_opponent,
+    is_mixed_doubles_team,
+    run_matchmaking,
+)
 
 
 def player(
@@ -58,6 +64,71 @@ def fallback_matchmaking_mode():
 
 
 class MixedDoublesMatchmakingTests(unittest.TestCase):
+    def test_normal_singles_matches_two_unrated_players_immediately(self):
+        waiting_player = player("a", matchmaking.DEFAULT_MATCHMAKING_RATING, "male")
+        candidate = player("b", matchmaking.DEFAULT_MATCHMAKING_RATING, "male")
+        for entry in (waiting_player, candidate):
+            entry["city_code"] = None
+            entry["province_code"] = None
+            entry["region_code"] = None
+            entry["matches_played"] = 0
+            entry["is_unrated"] = True
+
+        with fallback_matchmaking_mode():
+            result = find_best_opponent(
+                player=waiting_player,
+                candidates=[candidate],
+                sport="badminton",
+                match_format="singles",
+                mode="normal",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["player_id"], "b")
+
+    def test_normal_unrated_pair_gets_calibration_floor_when_ml_score_is_low(self):
+        waiting_player = player("a", matchmaking.DEFAULT_MATCHMAKING_RATING, "male")
+        candidate = player("b", matchmaking.DEFAULT_MATCHMAKING_RATING, "male")
+        for entry in (waiting_player, candidate):
+            entry["city_code"] = None
+            entry["province_code"] = None
+            entry["region_code"] = None
+            entry["matches_played"] = 0
+            entry["is_unrated"] = True
+
+        with patch("app.services.matchmaking.score_candidate", return_value=0.1):
+            result = find_best_opponent(
+                player=waiting_player,
+                candidates=[candidate],
+                sport="badminton",
+                match_format="singles",
+                mode="normal",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["_ml_score"], matchmaking.MATCH_MODE_CONFIG["normal"]["min_quality"])
+
+    def test_normal_singles_relaxes_geo_and_quality_for_waiting_candidate(self):
+        waiting_player = player("a", 1500, "male")
+        candidate = player("b", 2000, "male")
+        for entry in (waiting_player, candidate):
+            entry["city_code"] = None
+            entry["province_code"] = None
+            entry["region_code"] = None
+        candidate["queue_wait_seconds"] = 600
+
+        with fallback_matchmaking_mode():
+            result = find_best_opponent(
+                player=waiting_player,
+                candidates=[candidate],
+                sport="badminton",
+                match_format="singles",
+                mode="normal",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["player_id"], "b")
+
     def test_mixed_doubles_returns_male_female_teams(self):
         result = run_matchmaking(
             [

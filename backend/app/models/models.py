@@ -82,6 +82,9 @@ class Profile(Base):
     referee_boost_until    = Column(TIMESTAMP(timezone=True))
     fcm_token              = Column(String)
     token_version          = Column(Integer, nullable=False, default=0)
+    phone_number           = Column(String)
+    sms_notifications_enabled = Column(Boolean, default=False, nullable=False)
+    phone_verified         = Column(Boolean, default=False, nullable=False)
     created_at             = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
     updated_at             = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
@@ -230,6 +233,7 @@ class OpenPlaySession(Base):
     target_score   = Column(Integer, default=11)
     win_by_two     = Column(Boolean, default=False)
     auto_assign_enabled = Column(Boolean, default=True)
+    warm_up_duration_seconds = Column(Integer, nullable=False, default=0)  # 0 = no warm-up
     skill_min      = Column(Numeric)
     skill_max      = Column(Numeric)
     notes          = Column(Text)
@@ -249,6 +253,9 @@ class OpenPlayParticipant(Base):
     user_id    = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
     status     = Column(String, nullable=False, default="confirmed")  # confirmed|waitlisted|cancelled
     joined_at  = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+    checked_in             = Column(Boolean, nullable=False, default=False)
+    checked_in_at          = Column(TIMESTAMP(timezone=True))
+    checkin_reminder_sent  = Column(Boolean, nullable=False, default=False)
 
     session    = relationship("OpenPlaySession", back_populates="participants")
 
@@ -297,9 +304,10 @@ class OpenPlayAssignment(Base):
     id             = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id      = Column(UUID(as_uuid=True), ForeignKey("open_play_sessions.id", ondelete="CASCADE"), nullable=False)
     session_court_id = Column(UUID(as_uuid=True), ForeignKey("open_play_session_courts.id", ondelete="CASCADE"), nullable=False)
-    status         = Column(String, nullable=False, default="called")  # called|in_game|completed|expired|cancelled
+    status         = Column(String, nullable=False, default="called")  # called|warming_up|in_game|completed|expired|cancelled
     assigned_at    = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
     ack_deadline_at = Column(TIMESTAMP(timezone=True))
+    warmup_started_at = Column(TIMESTAMP(timezone=True))
     started_at     = Column(TIMESTAMP(timezone=True))
     completed_at   = Column(TIMESTAMP(timezone=True))
     winner_side    = Column(Integer)
@@ -323,6 +331,16 @@ class OpenPlayAssignmentPlayer(Base):
     outcome        = Column(String)
 
     assignment     = relationship("OpenPlayAssignment", back_populates="players")
+
+
+class OpenPlayCourtManager(Base):
+    __tablename__ = "open_play_court_managers"
+
+    id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_court_id = Column(UUID(as_uuid=True), ForeignKey("open_play_session_courts.id", ondelete="CASCADE"), nullable=False)
+    user_id          = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    assigned_by      = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    assigned_at      = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
 class Party(Base):
@@ -431,10 +449,13 @@ class Tournament(Base):
     max_participants  = Column(Integer, default=32)
     status            = Column(String, default="upcoming")
     registration_open = Column(Boolean, default=True)
+    access_type       = Column(String, default="open", nullable=False)  # open | exclusive
+    exclusive_scope   = Column(String, default="city", nullable=False)  # city | province | region
     starts_at         = Column(TIMESTAMP(timezone=True))
     ends_at           = Column(TIMESTAMP(timezone=True))
     region_code       = Column(String)
     province_code     = Column(String)
+    city_mun_code     = Column(String)
     # random | seeded | smart_tiered
     draw_method       = Column(String, default="random", nullable=False)
     # { group_count, balance_by_rating, separate_clubs, separate_locations }
@@ -447,6 +468,15 @@ class Tournament(Base):
     knockout_best_of      = Column(Integer, default=3, nullable=False)
     # group stage / pool / round-robin / swiss per-match best-of (1 or 3)
     group_stage_best_of   = Column(Integer, default=1, nullable=False)
+    # casual = no rating impact, ranked = standard, championship = strict rules
+    tournament_mode       = Column(String, default="ranked", nullable=False)
+    # generate a 3rd-place match for single/double elimination
+    third_place_match     = Column(Boolean, default=False, nullable=False)
+    # wildcard spots from non-advancing pool/group players into knockout
+    wildcard_count        = Column(Integer, default=0, nullable=False)
+    # court count and estimated match duration for schedule feasibility
+    court_count           = Column(Integer)
+    match_duration_minutes = Column(Integer, default=30, nullable=False)
     created_at         = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
@@ -478,6 +508,7 @@ class Match(Base):
     loser_next_match_id   = Column(UUID(as_uuid=True), ForeignKey("matches.id"))
     best_of             = Column(Integer)   # per-match override: 1, 3, or 5 (None = use tournament/sport default)
     score_limit         = Column(Integer)   # per-match points-per-set override: 11, 15, or 21
+    rating_changes      = Column(JSONB)     # {player_id: delta} stored at completion
     ml_match_score      = Column(Numeric)
     queue_city_code     = Column(String)   # resolved play location snapshot at queue-join time
     queue_province_code = Column(String)
@@ -739,6 +770,16 @@ class PostReaction(Base):
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     post       = relationship("FeedPost", back_populates="reactions")
+
+
+class FeedNotification(Base):
+    __tablename__ = "feed_notifications"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id    = Column(UUID(as_uuid=True), ForeignKey("profiles.id",   ondelete="CASCADE"), nullable=False)
+    post_id    = Column(UUID(as_uuid=True), ForeignKey("feed_posts.id", ondelete="CASCADE"), nullable=False)
+    is_read    = Column(Boolean, default=False, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
 class GeographicData(Base):

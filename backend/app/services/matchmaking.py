@@ -28,6 +28,7 @@ BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 PlayerDict = dict[str, Any]
+DEFAULT_MATCHMAKING_RATING = 1500.0
 
 
 # ══════════════════════════════════════════════════════════
@@ -45,17 +46,24 @@ PlayerDict = dict[str, Any]
 #                      (0.0 = wait time ignored; 1.0 = full weight)
 #
 MATCH_MODE_CONFIG: dict = {
+    "normal": {
+        "min_quality":       0.45,
+        "geo_filter":        "city",     # same city/municipality required
+        "geo_relaxes_after": 600,        # relax to province after 10 min
+        "geo_relaxed_to":    "province", # never drop below same-province
+        "wait_weight":       1.0,
+    },
     "quick": {
         "min_quality":       0.45,
-        "geo_filter":        "province",
-        "geo_relaxes_after": 300,       # relax after 5 min
-        "geo_relaxed_to":    "region",
+        "geo_filter":        "city",     # same city/municipality required
+        "geo_relaxes_after": 600,        # relax to province after 10 min
+        "geo_relaxed_to":    "province", # never drop below same-province
         "wait_weight":       1.0,
     },
     "ranked": {
         "min_quality":       0.65,      # stricter — protect rating integrity
-        "geo_filter":        "region",
-        "geo_relaxes_after": None,      # never relaxes for ranked
+        "geo_filter":        "city",    # same city/municipality required
+        "geo_relaxes_after": None,      # never relaxes — city boundary is permanent
         "geo_relaxed_to":    None,
         "wait_weight":       0.5,       # wait time matters less than fairness
     },
@@ -98,15 +106,17 @@ _GEO_LEVEL_MIN: dict = {
 }
 
 _MAX_RATING_GAP: dict = {
-    "ranked": 500.0,
-    "quick": 800.0,
-    "club": 800.0,
-    "friendly": 1200.0,
+    "normal":     350.0,   # tightened — prevent grossly mismatched calibration games
+    "ranked":     100.0,   # strict mirror — singles: individual gap; doubles: team-average gap
+    "quick":      350.0,
+    "club":       800.0,
+    "friendly":  1200.0,
     "tournament": 900.0,
-    "booked": 1000.0,
+    "booked":    1000.0,
 }
 
 _MAX_AVG_RD: dict = {
+    "normal": 450.0,
     "ranked": 300.0,
     "quick": 450.0,
     "club": 450.0,
@@ -115,16 +125,95 @@ _MAX_AVG_RD: dict = {
     "booked": 450.0,
 }
 
+# ── Per-player factor validation ──────────────────────────────────────────────
+#
+# Before any player enters ML scoring the following per-player fields are
+# checked for presence and plausible bounds.  These map directly to the
+# inputs that produce ML feature vector components 1-6 (rating_diff, avg_rd,
+# winrate_diff, activeness_diff, streak_diff, geo_score).  Components 7-11
+# (h2h_count, same_skill, wait_seconds, sport_enc, format_enc) are pair- or
+# match-level values validated at the pair-check stage.
+#
+_PLAYER_FACTOR_BOUNDS: dict[str, tuple[float, float]] = {
+    "rating":           (100.0,  4000.0),
+    "rating_deviation": (0.0,    500.0),
+    "win_rate":         (0.0,    1.0),
+    "activeness_score": (0.0,    1.0),
+    "current_streak":   (-500.0, 500.0),
+}
+
+# Modes where missing location codes are a hard rejection (ranked fairness).
+_LOCATION_REQUIRED_MODES: frozenset = frozenset({"ranked"})
+# Modes that ignore location entirely — no geo filter, so codes are irrelevant.
+_LOCATION_EXEMPT_MODES: frozenset = frozenset({"club", "tournament"})
+
+
+def validate_player_factors(player: PlayerDict, mode: str = "quick") -> tuple[bool, str]:
+    """
+    Gate-check all per-player ML factor inputs before the player enters scoring.
+
+    Pipeline position: called first in find_best_opponent, run_matchmaking, and
+    can_join_doubles_lobby — before geo, rating-gap, or ML quality checks.
+
+    Validates:
+      • Factors 1-5 inputs : rating, rating_deviation, win_rate,
+                              activeness_score, current_streak
+        — must be numeric and within _PLAYER_FACTOR_BOUNDS.
+      • Factor 6 input (geo): region_code / province_code / city_code
+        — hard-rejected in ranked mode if all are missing;
+          warning-logged (but allowed) in other geo-filtered modes;
+          not checked in club / tournament modes.
+
+    Returns (True, "") on pass, or (False, human-readable reason) on fail.
+    """
+    pid = str(player.get("player_id", "?"))
+
+    for field, (lo, hi) in _PLAYER_FACTOR_BOUNDS.items():
+        raw = player.get(field)
+        if raw is None:
+            return False, f"player {pid}: missing required factor '{field}'"
+        try:
+            fval = float(raw)
+        except (TypeError, ValueError):
+            return False, f"player {pid}: non-numeric value for '{field}' ({raw!r})"
+        if not (lo <= fval <= hi):
+            return False, (
+                f"player {pid}: factor '{field}'={fval:.4g} "
+                f"outside expected bounds [{lo}, {hi}]"
+            )
+
+    # Geo / location check (factor 6 input)
+    has_location = bool(
+        player.get("region_code") or
+        player.get("province_code") or
+        player.get("city_code")
+    )
+    if not has_location and mode not in _LOCATION_EXEMPT_MODES:
+        if mode in _LOCATION_REQUIRED_MODES:
+            return False, (
+                f"player {pid}: location data required for '{mode}' mode — "
+                "complete profile setup first"
+            )
+        logger.warning(
+            f"[mm/validate/{mode}] player {pid} has no location codes — "
+            "geo score will be 0.2; unlikely to pass geo filter"
+        )
+
+    return True, ""
+
+
 _MAX_DOUBLES_ROLE_GAP: dict = {
-    "ranked": 250.0,
-    "quick": 500.0,
-    "club": 500.0,
-    "friendly": 700.0,
+    "normal":     500.0,
+    "ranked":     100.0,   # strict mirror — each role pair (top vs top, bot vs bot) within 100
+    "quick":      500.0,
+    "club":       500.0,
+    "friendly":   700.0,
     "tournament": 450.0,
-    "booked": 500.0,
+    "booked":     500.0,
 }
 
 _DOUBLES_ROLE_GAP_RELAX: dict = {
+    "normal": 100.0,
     "ranked": 0.0,
     "quick": 100.0,
     "club": 75.0,
@@ -198,14 +287,61 @@ def average_geo_score(team_a: list[PlayerDict], team_b: list[PlayerDict]) -> flo
     return float(np.mean(scores)) if scores else 0.5
 
 
+def effective_geo_min(mode: str, wait_seconds: int = 0) -> float:
+    cfg = MATCH_MODE_CONFIG.get(mode, MATCH_MODE_CONFIG["quick"])
+    geo_filter = cfg["geo_filter"]
+    if geo_filter == "none":
+        return 0.0
+
+    relax_after = cfg["geo_relaxes_after"]
+    relaxed_to = cfg.get("geo_relaxed_to")
+    if relax_after is not None and wait_seconds >= relax_after and relaxed_to:
+        return float(_GEO_LEVEL_MIN.get(relaxed_to, 0.0))
+
+    return float(_GEO_LEVEL_MIN.get(geo_filter, 0.4))
+
+
+def is_geo_pool_compatible(players: list[PlayerDict], mode: str, wait_seconds: int = 0) -> tuple[bool, float, float]:
+    """
+    Public queues should not form a match from players in incompatible locations.
+    Returns (compatible, weakest_pair_geo_score, required_geo_score).
+    """
+    min_geo = effective_geo_min(mode, wait_seconds)
+    if min_geo <= 0.0 or len(players) < 2:
+        return True, 1.0, min_geo
+
+    weakest = 1.0
+    for idx, pa in enumerate(players):
+        for pb in players[idx + 1:]:
+            score = compute_geo_score(
+                pa.get("city_code"),     pb.get("city_code"),
+                pa.get("province_code"), pb.get("province_code"),
+                pa.get("region_code"),   pb.get("region_code"),
+            )
+            weakest = min(weakest, score)
+            if score < min_geo:
+                return False, weakest, min_geo
+
+    return True, weakest, min_geo
+
+
 def team_avg(players: list[PlayerDict], field: str, default: float) -> float:
     """Average a stat field across a list of player dicts."""
     vals = [float(p.get(field, default)) for p in players]
     return float(np.mean(vals)) if vals else default
 
 
-def _player_rating(player: PlayerDict, default: float = 1200.0) -> float:
+def _player_rating(player: PlayerDict, default: float = DEFAULT_MATCHMAKING_RATING) -> float:
     return float(player.get("rating", default))
+
+
+def _is_unrated_player(player: PlayerDict) -> bool:
+    return bool(player.get("is_unrated")) or int(player.get("matches_played", 0) or 0) <= 0
+
+
+def _all_unrated_normal(players: list[PlayerDict], mode: str) -> bool:
+    """True when every player is brand-new (no match history) and mode allows geo bypass."""
+    return mode in ("normal", "quick") and all(_is_unrated_player(p) for p in players)
 
 
 def _effective_doubles_role_gap_cap(mode: str, wait_seconds: int) -> float:
@@ -446,54 +582,91 @@ def find_best_opponent(
     base_min    = min_score if min_score != 0.45 else cfg["min_quality"]
     wait_weight = float(cfg["wait_weight"])
 
+    # ── GUARD 1: validate queuing player's own factors ─────────────────────────
+    player_ok, player_reason = validate_player_factors(player, mode)
+    if not player_ok:
+        logger.warning(f"[1v1/{mode}] Queuing player failed factor check: {player_reason}")
+        return None
+    # ──────────────────────────────────────────────────────────────────────────
+
     best_candidate, best_score = None, -1.0
+    best_effective_wait = 0
 
     for candidate in candidates:
         try:
             effective_wait = max(wait_seconds, int(candidate.get("queue_wait_seconds", 60)))
             weighted_wait  = int(effective_wait * wait_weight)
 
-            # ── Mode-aware geo pre-filter ──────────────────────────────────────
-            geo_filter   = cfg["geo_filter"]
-            relax_after  = cfg["geo_relaxes_after"]
-            relaxed_to   = cfg.get("geo_relaxed_to")
+            # ── GUARD 2: validate candidate's per-player ML factors ────────────
+            cand_ok, cand_reason = validate_player_factors(candidate, mode)
+            if not cand_ok:
+                logger.debug(f"[1v1/{mode}] Skipping candidate: {cand_reason}")
+                continue
+            # ──────────────────────────────────────────────────────────────────
 
-            # Determine which geo level applies right now
-            if geo_filter == "none":
-                min_geo = 0.0   # no geo restriction
-            else:
-                base_min_geo = _GEO_LEVEL_MIN.get(geo_filter, 0.4)
-                if relax_after is not None and effective_wait >= relax_after and relaxed_to:
-                    min_geo = _GEO_LEVEL_MIN.get(relaxed_to, 0.0)
-                else:
-                    min_geo = base_min_geo
-
-            if min_geo > 0.0:
+            # ── GUARD 3: geo proximity filter ─────────────────────────────────
+            min_geo = effective_geo_min(mode, effective_wait)
+            # Unrated players still need calibration matches but must stay within
+            # the same region — cross-region matches make no sense geographically.
+            unrated_both = (
+                mode == "normal"
+                and _is_unrated_player(player)
+                and _is_unrated_player(candidate)
+            )
+            effective_min_geo = min(_GEO_LEVEL_MIN["city"], min_geo) if unrated_both else min_geo
+            if effective_min_geo > 0.0:
                 geo = compute_geo_score(
                     player.get("city_code"),     candidate.get("city_code"),
                     player.get("province_code"), candidate.get("province_code"),
                     player.get("region_code"),   candidate.get("region_code"),
                 )
-                if geo < min_geo:
+                if geo < effective_min_geo:
                     logger.debug(
-                        f"[1v1/{mode}] Skipping {candidate.get('player_id')}: "
-                        f"geo={geo:.1f} < required {min_geo:.1f} (wait={effective_wait}s)"
+                        f"[1v1/{mode}] REJECTED {candidate.get('player_id')} "
+                        f"[geo] score={geo:.2f} < required={effective_min_geo:.2f} (wait={effective_wait}s)"
                     )
                     continue
             # ──────────────────────────────────────────────────────────────────
 
-            player_rating = float(player.get("rating", 1200))
-            player_rd = float(player.get("rating_deviation", 200))
-            candidate_rating = float(candidate.get("rating", 1200))
-            candidate_rd = float(candidate.get("rating_deviation", 200))
+            # ── GUARD 4: hard rating-gap + RD cap ─────────────────────────────
+            player_rating    = float(player.get("rating", DEFAULT_MATCHMAKING_RATING))
+            player_rd        = float(player.get("rating_deviation", 200))
+            candidate_rating = float(candidate.get("rating", DEFAULT_MATCHMAKING_RATING))
+            candidate_rd     = float(candidate.get("rating_deviation", 200))
             if not _passes_hard_match_rules(player_rating, player_rd, candidate_rating, candidate_rd, mode):
                 logger.debug(
-                    f"[1v1/{mode}] Skipping {candidate.get('player_id')}: "
-                    f"rating_gap={abs(player_rating - candidate_rating):.0f}, "
+                    f"[1v1/{mode}] REJECTED {candidate.get('player_id')} "
+                    f"[rating_gap] gap={abs(player_rating - candidate_rating):.0f} "
                     f"avg_rd={(player_rd + candidate_rd) / 2:.0f}"
                 )
                 continue
+            # ──────────────────────────────────────────────────────────────────
 
+            # ── GUARD 5: calibration tier separation ──────────────────────────────
+            # Players with < 10 matches (no skill rating yet) only match each other.
+            # Rated players (10+ matches) only match other rated players.
+            _CALIBRATION_THRESHOLD = 10
+            player_calibrating   = int(player.get("matches_played", 0))    < _CALIBRATION_THRESHOLD
+            candidate_calibrating = int(candidate.get("matches_played", 0)) < _CALIBRATION_THRESHOLD
+            if player_calibrating != candidate_calibrating:
+                logger.debug(
+                    f"[1v1/{mode}] REJECTED {candidate.get('player_id')} "
+                    f"[calibration_tier] player_calibrating={player_calibrating} "
+                    f"cand_calibrating={candidate_calibrating}"
+                )
+                continue
+            # ──────────────────────────────────────────────────────────────────
+
+            # ── GUARD 6: same-opponent cap — max 5 completed matches vs the same player ──
+            if int(candidate.get("h2h_count", 0)) >= 5:
+                logger.debug(
+                    f"[1v1/{mode}] REJECTED {candidate.get('player_id')} "
+                    f"[h2h_cap] already played {candidate.get('h2h_count')} times"
+                )
+                continue
+            # ──────────────────────────────────────────────────────────────────
+
+            # ── SCORE: ML model (factors 1-11) ────────────────────────────────
             score = score_candidate(
                 rating_a     = player_rating,
                 rd_a         = player_rd,
@@ -518,30 +691,41 @@ def find_best_opponent(
                 wait_seconds = weighted_wait,
                 h2h_count    = int(candidate.get("h2h_count", 0)),
             )
+            if unrated_both:
+                # Brand-new players need calibration matches before the ML model
+                # has enough signal; do not let missing history/location strand them.
+                score = max(score, base_min)
 
             candidate["_ml_score"] = score
 
             if score > best_score:
                 best_score, best_candidate = score, candidate
+                best_effective_wait = effective_wait
 
         except Exception as e:
             logger.warning(f"Error scoring candidate {candidate.get('player_id')}: {e}")
             continue
 
-    # For quick/friendly modes: threshold relaxes slightly the longer players wait.
-    # For ranked mode: threshold never drops below a hard floor.
+    # ── GUARD 7: mode quality threshold ──────────────────────────────────────
+    # Ranked: threshold never relaxes (protect rating integrity).
+    # All others: up to 0.15 bonus for long-waiting players, floor at 0.20.
     if mode == "ranked":
-        effective_min = base_min   # no relaxation for ranked
+        effective_min = base_min
     else:
-        wait_bonus    = min(wait_seconds / 600.0, 0.15)
+        wait_bonus    = min(best_effective_wait / 600.0, 0.15)
         effective_min = max(base_min - wait_bonus, 0.20)
 
     if best_score >= effective_min:
-        logger.info(f"[1v1/{mode}] Match found: score={best_score:.3f} threshold={effective_min:.3f}")
+        logger.info(
+            f"[1v1/{mode}] ACCEPTED: score={best_score:.3f} >= threshold={effective_min:.3f}"
+        )
         return best_candidate
 
-    logger.info(f"[1v1/{mode}] No match. Best={best_score:.3f} < threshold={effective_min:.3f}")
+    logger.info(
+        f"[1v1/{mode}] No match — best={best_score:.3f} < threshold={effective_min:.3f}"
+    )
     return None
+    # ──────────────────────────────────────────────────────────────────────────
 
 
 # ══════════════════════════════════════════════════════════
@@ -564,9 +748,9 @@ def _score_doubles_split(
     ):
         return 0.0
 
-    rating_a = team_avg(team_a, "rating", 1200)
+    rating_a = team_avg(team_a, "rating", DEFAULT_MATCHMAKING_RATING)
     rd_a = team_avg(team_a, "rating_deviation", 200)
-    rating_b = team_avg(team_b, "rating", 1200)
+    rating_b = team_avg(team_b, "rating", DEFAULT_MATCHMAKING_RATING)
     rd_b = team_avg(team_b, "rating_deviation", 200)
     if not _passes_hard_match_rules(rating_a, rd_a, rating_b, rd_b, mode):
         return 0.0
@@ -637,9 +821,30 @@ def run_matchmaking(
     if len(four_players) != 4:
         logger.error(f"run_matchmaking requires exactly 4 players, got {len(four_players)}")
         return None
+
+    # ── GUARD 1: validate every player's per-player ML factors ───────────────
+    for p in four_players:
+        ok, reason = validate_player_factors(p, mode)
+        if not ok:
+            logger.warning(f"[2v2/{mode}] Player failed factor check: {reason}")
+            return None
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── GUARD 2: gender composition (mixed doubles) ───────────────────────────
     if match_format == "mixed_doubles" and not is_mixed_doubles_pool_viable(four_players):
         logger.info("[2v2/mixed_doubles] Pool is not gender-viable for mixed doubles.")
         return None
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── GUARD 3: geo pool compatibility ──────────────────────────────────────
+    if not _all_unrated_normal(four_players, mode):
+        geo_ok, weakest_geo, required_geo = is_geo_pool_compatible(four_players, mode, wait_seconds)
+        if not geo_ok:
+            logger.info(
+                f"[2v2/{mode}] REJECTED [geo] weakest={weakest_geo:.2f} < required={required_geo:.2f}"
+            )
+            return None
+    # ─────────────────────────────────────────────────────────────────────────
 
     p0   = four_players[0]
     rest = four_players[1:]  # [P1, P2, P3]
@@ -674,8 +879,8 @@ def run_matchmaking(
         return None
 
     team_a, team_b = best_split
-    avg_a = team_avg(team_a, "rating", 1200)
-    avg_b = team_avg(team_b, "rating", 1200)
+    avg_a = team_avg(team_a, "rating", DEFAULT_MATCHMAKING_RATING)
+    avg_b = team_avg(team_b, "rating", DEFAULT_MATCHMAKING_RATING)
     perf_a, perf_conf_a = _team_avg_performance(team_a)
     perf_b, perf_conf_b = _team_avg_performance(team_b)
 
@@ -730,9 +935,9 @@ def score_doubles_entry(
         )
         return float(best_split["score"]) if best_split else 0.0
 
-    incoming_rating = float(incoming.get("rating", 1200))
+    incoming_rating = float(incoming.get("rating", DEFAULT_MATCHMAKING_RATING))
     incoming_rd = float(incoming.get("rating_deviation", 200))
-    lobby_rating = team_avg(lobby_players, "rating", 1200)
+    lobby_rating = team_avg(lobby_players, "rating", DEFAULT_MATCHMAKING_RATING)
     lobby_rd = team_avg(lobby_players, "rating_deviation", 200)
     if not _passes_hard_match_rules(incoming_rating, incoming_rd, lobby_rating, lobby_rd, mode):
         return 0.0
@@ -775,6 +980,30 @@ def can_join_doubles_lobby(
     """
     if not lobby_players:
         return True
+
+    # ── GUARD 1: validate incoming player's per-player ML factors ─────────────
+    ok, reason = validate_player_factors(incoming, mode)
+    if not ok:
+        logger.warning(f"[doubles_entry/{mode}] Incoming player failed factor check: {reason}")
+        return False
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── GUARD 2: geo pool compatibility ──────────────────────────────────────
+    all_players = [*lobby_players, incoming]
+    if not _all_unrated_normal(all_players, mode):
+        geo_ok, weakest_geo, required_geo = is_geo_pool_compatible(
+            all_players,
+            mode,
+            lobby_wait_seconds,
+        )
+        if not geo_ok:
+            logger.debug(
+                f"[doubles_entry/{mode}] REJECTED [geo] weakest={weakest_geo:.2f} < required={required_geo:.2f}"
+            )
+            return False
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── GUARD 3+4+5: skill gate via score_doubles_entry + mode threshold ──────
     score = score_doubles_entry(
         incoming, lobby_players, sport, match_format, lobby_wait_seconds, mode
     )
@@ -785,12 +1014,15 @@ def can_join_doubles_lobby(
     else:
         wait_bonus    = min(lobby_wait_seconds / 600.0, 0.15)
         effective_min = max(base_min - wait_bonus, 0.20)
+    result = score >= effective_min
     logger.debug(
-        f"[doubles_entry/{mode}] score={score:.3f} threshold={effective_min:.3f} "
+        f"[doubles_entry/{mode}] {'ACCEPTED' if result else 'REJECTED [quality]'}: "
+        f"score={score:.3f} {'≥' if result else '<'} threshold={effective_min:.3f} | "
         f"incoming_rating={incoming.get('rating', '?')} "
-        f"lobby_avg={team_avg(lobby_players, 'rating', 1200):.0f}"
+        f"lobby_avg={team_avg(lobby_players, 'rating', DEFAULT_MATCHMAKING_RATING):.0f}"
     )
-    return score >= effective_min
+    return result
+    # ──────────────────────────────────────────────────────────────────────────
 
 
 # ══════════════════════════════════════════════════════════

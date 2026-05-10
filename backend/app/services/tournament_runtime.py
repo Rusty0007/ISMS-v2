@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 from sqlalchemy.orm import Session
 
@@ -32,8 +33,11 @@ def _match_status_value(match: Match) -> str:
 def _display_name(profile: Profile | None) -> str:
     if profile is None:
         return "A tournament official"
-    full_name = f"{profile.first_name or ''} {profile.last_name or ''}".strip()
-    return full_name or f"@{profile.username}" if profile.username else "A tournament official"
+    first_name = cast(str | None, getattr(profile, "first_name", None))
+    last_name = cast(str | None, getattr(profile, "last_name", None))
+    username = cast(str | None, getattr(profile, "username", None))
+    full_name = f"{first_name or ''} {last_name or ''}".strip()
+    return full_name or (f"@{username}" if username else "A tournament official")
 
 
 def _participant_ids(match: Match) -> list[str]:
@@ -89,7 +93,7 @@ def dispatch_due_tournament_match_reminders(db: Session, tournament_id: str | No
         if status in ("ongoing", "completed", "cancelled", "invalidated"):
             continue
 
-        scheduled_at = _normalize_dt(match.scheduled_at)
+        scheduled_at = _normalize_dt(cast(datetime | None, getattr(match, "scheduled_at", None)))
         if scheduled_at is None:
             continue
 

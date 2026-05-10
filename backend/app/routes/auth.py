@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
+from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -96,6 +97,7 @@ class RegisterRequest(BaseModel):
     password: str
     first_name: str
     last_name: str
+    phone_number: Optional[str] = None
 
 class LoginRequest(BaseModel):
     email: str
@@ -171,6 +173,16 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
 
     user_id = str(uuid.uuid4())
 
+    normalised_phone = None
+    if data.phone_number:
+        from app.services.sms import normalise_ph_number
+        normalised_phone = normalise_ph_number(data.phone_number.strip())
+        if not normalised_phone:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid phone number. Use format: 09XXXXXXXXX or +639XXXXXXXXX"
+            )
+
     new_profile = Profile(
         id=user_id,
         email=data.email,
@@ -178,6 +190,9 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
         first_name=data.first_name,
         last_name=data.last_name,
         profile_setup_complete=False,
+        phone_number=normalised_phone,
+        phone_verified=False,
+        sms_notifications_enabled=False,
     )
     db.add(new_profile)
 
@@ -206,23 +221,20 @@ def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
     user_id = str(profile.id)
 
     # ── Concurrent-session handling ────────────────────────
-    # If a session key exists in Redis, another device/tab still has this account open.
-    # We kick the old session (real-time SSE push) and replace it with the new one.
-    # The new login is NOT blocked — the user should never be locked out of their own account.
+    # If a stale Redis session exists (e.g. the previous logout API call failed,
+    # the token expired before logout, or the browser closed without logging out),
+    # silently invalidate it and proceed with the new login in a single step.
+    # Raising a 409 here forces the user to click login twice — unnecessary friction.
+    session_replaced = False
     if _has_active_session(user_id):
-        setattr(profile, "token_version", current_version + 1)
-        _publish_kick(user_id)
+        _publish_kick(user_id)   # notify any still-open tabs
         _clear_session(user_id)
-        _log_audit(db, user_id, "ALL_SESSIONS_TERMINATED", ip, {
+        _log_audit(db, user_id, "SESSION_REPLACED", ip, {
             "email": str(profile.email),
-            "note": "Another active session was detected; all sessions were signed out.",
+            "note": "Stale session cleared automatically on new login.",
         })
-        db.commit()
-        logger.warning(f"[auth] ALL_SESSIONS_TERMINATED for user {user_id} from {ip}")
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Another active session was detected. For security, all sessions for this account were signed out. Please sign in again.",
-        )
+        logger.info(f"[auth] Stale session replaced for user {user_id} from {ip}")
+        session_replaced = True
 
     # ── Issue new token ────────────────────────────────────
     new_version = current_version + 1
@@ -400,8 +412,21 @@ async def notification_event_stream(token: str, db: Session = Depends(get_db)):
         try:
             while True:
                 msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if msg and msg.get("data") == "new":
-                    yield 'data: {"event":"new_notification"}\n\n'
+                if msg:
+                    raw = msg.get("data", "")
+                    if raw == "new":
+                        yield 'data: {"event":"new_notification"}\n\n'
+                    else:
+                        try:
+                            import json as _json
+                            parsed = _json.loads(raw)
+                            t = parsed.get("type")
+                            if t == "feed_unread_count":
+                                yield f'data: {{"event":"feed_unread_count","count":{int(parsed["count"])}}}\n\n'
+                            elif t == "notification":
+                                yield 'data: {"event":"new_notification"}\n\n'
+                        except Exception:
+                            pass
                 ping_ticks += 1
                 if ping_ticks % 30 == 0:
                     yield ": ping\n\n"

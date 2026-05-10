@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     # --- Firebase Cloud Messaging ---
     firebase_credentials_path: str = "firebase-credentials.json"
 
+    # --- UniSMS (SMS notifications) ---
+    unisms_api_key: str = ""
+    unisms_sender_id: str = "ISMS"        # branded sender name (requires verification)
+    unisms_base_url: str = "https://unismsapi.com/api/sms"
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]

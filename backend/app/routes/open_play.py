@@ -67,6 +67,8 @@ except Exception as exc:
     logger.warning(f"[open_play] Async Redis unavailable for SSE. Reason: {exc}")
 
 
+from app.models.models import OpenPlayCourtManager
+
 class CreateOpenPlaySessionRequest(BaseModel):
     title: str
     description: Optional[str] = None
@@ -86,6 +88,7 @@ class CreateOpenPlaySessionRequest(BaseModel):
     target_score: int = Field(default=11, ge=1, le=99)
     win_by_two: bool = False
     auto_assign_enabled: bool = True
+    warm_up_duration_seconds: int = Field(default=0, ge=0, le=600)  # 0 = no warm-up phase
 
 
 class UpdateOpenPlaySessionRequest(BaseModel):
@@ -106,6 +109,7 @@ class UpdateOpenPlaySessionRequest(BaseModel):
     target_score: Optional[int] = Field(default=None, ge=1, le=99)
     win_by_two: Optional[bool] = None
     auto_assign_enabled: Optional[bool] = None
+    warm_up_duration_seconds: Optional[int] = Field(default=None, ge=0, le=600)
 
 
 class JoinQueueRequest(BaseModel):
@@ -224,6 +228,7 @@ def _profile_brief(profile: Profile | None, rating: PlayerRating | None = None) 
     rating_status = _as_text_value(rating.rating_status, "CALIBRATING") if rating is not None else None
     return {
         "id": str(profile.id),
+        "username": profile.username,
         "first_name": profile.first_name,
         "last_name": profile.last_name,
         "avatar_url": profile.avatar_url,
@@ -275,6 +280,8 @@ def _serialize_participant_rows(
             "profile": _profile_brief(profiles_map.get(user_id), ratings_map.get(user_id)),
             "status": participant.status,
             "joined_at": _iso_utc(participant.joined_at),
+            "checked_in": _as_bool_value(getattr(participant, "checked_in", False)),
+            "checked_in_at": _iso_utc(getattr(participant, "checked_in_at", None)),
             "queue_status": queue_entry.status if queue_entry is not None else None,
             "is_ready": _as_bool_value(queue_entry.is_ready) if queue_entry is not None else False,
             "is_available_for_pairing": (
@@ -544,6 +551,22 @@ def _is_club_admin(club_id: str, user_id: str, db: Session) -> bool:
 
 def _is_session_admin(session: OpenPlaySession, user_id: str, db: Session) -> bool:
     return str(session.created_by) == user_id or _is_club_admin(str(session.club_id), user_id, db)
+
+
+def _is_court_manager(session_court_id: str, user_id: str, db: Session) -> bool:
+    """Return True if user is assigned as court manager for this session court."""
+    return db.query(OpenPlayCourtManager).filter(
+        OpenPlayCourtManager.session_court_id == session_court_id,
+        OpenPlayCourtManager.user_id == user_id,
+    ).first() is not None
+
+
+def _can_manage_court(assignment: OpenPlayAssignment, user_id: str, session: OpenPlaySession, db: Session) -> bool:
+    """Session admin OR court manager for the assignment's court."""
+    return (
+        _is_session_admin(session, user_id, db)
+        or _is_court_manager(str(assignment.session_court_id), user_id, db)
+    )
 
 
 def _get_session_or_404(session_id: str, db: Session) -> OpenPlaySession:
@@ -1084,6 +1107,54 @@ def _create_assignment(
     return True
 
 
+def _notify_next_in_queue(
+    session: OpenPlaySession,
+    just_called_entry_ids: set[str],
+    db: Session,
+) -> None:
+    """
+    After a court is filled, peek at who is next in the waiting queue and
+    send them a 'prepare now' heads-up so they can get ready before being called.
+    Sends to the next batch of players only — does not change any status.
+    """
+    court_size = _session_court_size(session)
+
+    # Remaining waiting entries after removing the ones just called
+    remaining = db.query(OpenPlayQueueEntry).filter(
+        OpenPlayQueueEntry.session_id == session.id,
+        OpenPlayQueueEntry.status.in_(["waiting", "holding"]),
+        ~OpenPlayQueueEntry.id.in_(list(just_called_entry_ids)) if just_called_entry_ids else True,
+    ).all()
+
+    ready = sorted(
+        [e for e in remaining if _as_bool_value(e.is_ready)],
+        key=lambda e: _queue_sort_key(session, e),
+    )
+
+    # Take exactly one court's worth of players as the "next" batch
+    next_batch: list[OpenPlayQueueEntry] = []
+    slots_needed = court_size
+    for entry in ready:
+        if slots_needed <= 0:
+            break
+        size = _entry_size(entry)
+        if size <= slots_needed:
+            next_batch.append(entry)
+            slots_needed -= size
+
+    if not next_batch:
+        return
+
+    next_user_ids = sorted({uid for e in next_batch for uid in _entry_user_ids(e)})
+    send_bulk_notifications(
+        next_user_ids,
+        title="You're Next — Get Ready",
+        body=f"You are next in line for '{session.title}'. Prepare to be called to a court shortly.",
+        notif_type="open_play_next",
+        reference_id=str(session.id),
+    )
+
+
 def _auto_assign_available_courts(session: OpenPlaySession, db: Session) -> bool:
     if _as_status_value(session.status) != "ongoing" or not _as_bool_value(session.auto_assign_enabled):
         return False
@@ -1159,11 +1230,17 @@ def _auto_assign_available_courts(session: OpenPlaySession, db: Session) -> bool
         if not challengers and held_player_count < court_size:
             continue
 
+        just_called = set(str(e.id) for e in held_entries + challengers)
         for challenger in challengers:
             waiting_ids.discard(str(challenger.id))
 
         if _create_assignment(session, court_state, held_entries + challengers, held_entries, player_snapshots, db):
             changed = True
+            # Notify whoever is next in the remaining queue to prepare
+            try:
+                _notify_next_in_queue(session, just_called, db)
+            except Exception:
+                pass  # never block assignment on notification failure
 
     return changed
 
@@ -1356,6 +1433,16 @@ def _serialize_runtime_state(session: OpenPlaySession, current_user_id: str, db:
                     my_assignment = serialized
                     break
 
+    # Check which courts the current user manages
+    managed_court_ids: set[str] = set()
+    if session_courts:
+        court_state_ids = [str(cs.id) for cs in session_courts]
+        manager_rows = db.query(OpenPlayCourtManager).filter(
+            OpenPlayCourtManager.session_court_id.in_(court_state_ids),
+            OpenPlayCourtManager.user_id == current_user_id,
+        ).all()
+        managed_court_ids = {str(r.session_court_id) for r in manager_rows}
+
     serialized_courts = []
     for court_state in session_courts:
         court = courts_map.get(str(court_state.court_id))
@@ -1368,6 +1455,7 @@ def _serialize_runtime_state(session: OpenPlaySession, current_user_id: str, db:
             "max_consecutive_wins": _as_int_value(court_state.max_consecutive_wins) if court_state.max_consecutive_wins is not None else None,
             "effective_rotation_mode": _effective_court_rotation_mode(session, court_state),
             "is_active": _as_bool_value(court_state.is_active),
+            "is_my_court": str(court_state.id) in managed_court_ids,
             "court": {
                 "id": str(court_state.court_id),
                 "name": court.name if court is not None else "Court",
@@ -1450,6 +1538,11 @@ def _serialize_session(session: OpenPlaySession, current_user_id: str, db: Sessi
         str(participant.user_id) == current_user_id and _as_status_value(participant.status) == "confirmed"
         for participant in session.participants
     )
+    my_participant_row = next(
+        (p for p in session.participants if str(p.user_id) == current_user_id and _as_status_value(p.status) == "confirmed"),
+        None,
+    )
+    my_checked_in = _as_bool_value(getattr(my_participant_row, "checked_in", False)) if my_participant_row else False
 
     club = db.query(Club).filter(Club.id == session.club_id).first()
     court_name = None
@@ -1474,6 +1567,7 @@ def _serialize_session(session: OpenPlaySession, current_user_id: str, db: Sessi
         "price_per_head": _as_float_value(session.price_per_head, 0.0),
         "status": str(session.status),
         "is_joined": is_joined,
+        "my_checked_in": my_checked_in,
         "can_manage": _is_session_admin(session, current_user_id, db),
         "court_name": court_name,
         "queue_mode": str(session.queue_mode),
@@ -1482,6 +1576,7 @@ def _serialize_session(session: OpenPlaySession, current_user_id: str, db: Sessi
         "target_score": _as_int_value(session.target_score, 11),
         "win_by_two": _as_bool_value(session.win_by_two),
         "auto_assign_enabled": _as_bool_value(session.auto_assign_enabled),
+        "warm_up_duration_seconds": _as_int_value(getattr(session, "warm_up_duration_seconds", 0), 0),
         "skill_min": None if session.skill_min is None else _as_float_value(session.skill_min),
         "skill_max": None if session.skill_max is None else _as_float_value(session.skill_max),
         "description": session.description,
@@ -1725,6 +1820,7 @@ def create_session(
         target_score=body.target_score,
         win_by_two=body.win_by_two,
         auto_assign_enabled=body.auto_assign_enabled,
+        warm_up_duration_seconds=body.warm_up_duration_seconds,
         status="upcoming",
     )
     db.add(session)
@@ -1805,6 +1901,8 @@ def update_session(
         setattr(session, "win_by_two", body.win_by_two)
     if body.auto_assign_enabled is not None:
         setattr(session, "auto_assign_enabled", body.auto_assign_enabled)
+    if body.warm_up_duration_seconds is not None:
+        setattr(session, "warm_up_duration_seconds", body.warm_up_duration_seconds)
 
     if _as_status_value(session.status) == "ongoing":
         _sync_session_runtime(session, db)
@@ -1830,6 +1928,29 @@ def start_session(
 
     setattr(session, "status", "ongoing")
     _ensure_session_courts(session, db)
+
+    # Auto-queue every checked-in participant so they don't need to tap "Join Queue"
+    for participant in session.participants:
+        if _as_status_value(participant.status) != "confirmed":
+            continue
+        if not _as_bool_value(getattr(participant, "checked_in", False)):
+            continue
+        already = db.query(OpenPlayQueueEntry).filter(
+            OpenPlayQueueEntry.session_id == session.id,
+            OpenPlayQueueEntry.created_by == participant.user_id,
+            OpenPlayQueueEntry.status.notin_(["cancelled"]),
+        ).first()
+        if not already:
+            db.add(OpenPlayQueueEntry(
+                session_id=session.id,
+                created_by=participant.user_id,
+                player1_id=participant.user_id,
+                entry_kind="solo",
+                status="waiting",
+                is_ready=True,
+                queued_at=_utcnow(),
+            ))
+    db.flush()
     _sync_session_runtime(session, db)
 
     participant_ids = [
@@ -1930,6 +2051,61 @@ def join_session(
     db.commit()
     _publish_open_play_event(session_id, reason="participant_joined")
     return {"status": participant_status, "message": f"You are {participant_status}."}
+
+
+@router.post("/open-play/{session_id}/checkin")
+def checkin_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Player marks themselves as physically present before or during the session."""
+    session = _get_session_or_404(session_id, db)
+    if _as_status_value(session.status) not in ("upcoming", "ongoing"):
+        raise HTTPException(400, "Check-in is only available for upcoming or ongoing sessions.")
+
+    participant = db.query(OpenPlayParticipant).filter(
+        OpenPlayParticipant.session_id == session.id,
+        OpenPlayParticipant.user_id == current_user["id"],
+        OpenPlayParticipant.status == "confirmed",
+    ).first()
+    if participant is None:
+        raise HTTPException(403, "You are not a confirmed participant of this session.")
+    if _as_bool_value(participant.checked_in):
+        return {"message": "Already checked in.", "checked_in": True}
+
+    setattr(participant, "checked_in", True)
+    setattr(participant, "checked_in_at", _utcnow())
+    db.flush()
+
+    # Auto-queue: if the session is already ongoing, immediately add this player
+    # to the queue so they don't need to tap "Join Queue" separately.
+    auto_queued = False
+    if _as_status_value(session.status) == "ongoing":
+        already_in_queue = db.query(OpenPlayQueueEntry).filter(
+            OpenPlayQueueEntry.session_id == session.id,
+            OpenPlayQueueEntry.created_by == current_user["id"],
+            OpenPlayQueueEntry.status.notin_(["cancelled"]),
+        ).first()
+        if not already_in_queue:
+            entry = OpenPlayQueueEntry(
+                session_id=session.id,
+                created_by=current_user["id"],
+                player1_id=current_user["id"],
+                entry_kind="solo",
+                status="waiting",
+                is_ready=True,
+                queued_at=_utcnow(),
+            )
+            db.add(entry)
+            db.flush()
+            _sync_session_runtime(session, db)
+            auto_queued = True
+
+    db.commit()
+    _publish_open_play_event(session_id, reason="participant_checkin")
+    msg = "Checked in and added to the queue automatically." if auto_queued else "Checked in successfully."
+    return {"message": msg, "checked_in": True, "auto_queued": auto_queued}
 
 
 @router.post("/open-play/{session_id}/leave")
@@ -2115,8 +2291,23 @@ def acknowledge_assignment(
         OpenPlayAssignmentPlayer.assignment_id == assignment.id
     ).all()
     if assignment_players and all(player.acknowledged_at is not None for player in assignment_players):
-        setattr(assignment, "status", "in_game")
-        setattr(assignment, "started_at", _utcnow())
+        warm_up_secs = int(getattr(session, "warm_up_duration_seconds", 0) or 0)
+        now = _utcnow()
+
+        if warm_up_secs > 0:
+            # Enter warm-up phase — court is active but match hasn't started
+            setattr(assignment, "status", "warming_up")
+            setattr(assignment, "warmup_started_at", now)
+            send_bulk_notifications(
+                [str(p.user_id) for p in assignment_players],
+                title="Warm-Up Started",
+                body=f"Court warm-up has begun. Match starts in {warm_up_secs // 60}:{warm_up_secs % 60:02d} minutes.",
+                notif_type="open_play_warmup",
+                reference_id=str(assignment.id),
+            )
+        else:
+            setattr(assignment, "status", "in_game")
+            setattr(assignment, "started_at", now)
 
         queue_entry_ids = {
             str(player.queue_entry_id)
@@ -2125,7 +2316,7 @@ def acknowledge_assignment(
         }
         for entry in db.query(OpenPlayQueueEntry).filter(OpenPlayQueueEntry.id.in_(list(queue_entry_ids))).all():
             setattr(entry, "status", "playing")
-            setattr(entry, "last_played_at", _utcnow())
+            setattr(entry, "last_played_at", now)
 
         court_state = db.query(OpenPlaySessionCourt).filter(OpenPlaySessionCourt.id == assignment.session_court_id).first()
         if court_state is not None:
@@ -2139,6 +2330,36 @@ def acknowledge_assignment(
     return {"message": "Acknowledged."}
 
 
+@router.post("/open-play/{session_id}/assignments/{assignment_id}/start-match")
+def start_match_after_warmup(
+    session_id: str,
+    assignment_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Manually transition a warming_up assignment to in_game (court manager or session admin)."""
+    session = _get_session_or_404(session_id, db)
+    assignment = db.query(OpenPlayAssignment).filter(
+        OpenPlayAssignment.id == assignment_id,
+        OpenPlayAssignment.session_id == session.id,
+    ).first()
+    if assignment is None:
+        raise HTTPException(404, "Assignment not found.")
+    if _as_status_value(assignment.status) != "warming_up":
+        raise HTTPException(400, "Assignment is not in warm-up phase.")
+
+    user_id = str(current_user["id"])
+    if not _is_session_admin(session, user_id, db) and not _is_court_manager(str(assignment.session_court_id), user_id, db):
+        raise HTTPException(403, "Not authorized. Must be session admin or court manager.")
+
+    now = _utcnow()
+    setattr(assignment, "status", "in_game")
+    setattr(assignment, "started_at", now)
+    db.commit()
+    _publish_open_play_event(session_id, reason="match_started")
+    return {"message": "Match started."}
+
+
 @router.post("/open-play/{session_id}/assignments/{assignment_id}/complete")
 def complete_assignment(
     session_id: str,
@@ -2148,17 +2369,19 @@ def complete_assignment(
     current_user: dict = Depends(get_current_user),
 ):
     session = _get_session_or_404(session_id, db)
-    if not _is_session_admin(session, str(current_user["id"]), db):
-        raise HTTPException(403, "Not authorized.")
-
     assignment = db.query(OpenPlayAssignment).filter(
         OpenPlayAssignment.id == assignment_id,
         OpenPlayAssignment.session_id == session.id,
     ).first()
     if assignment is None:
         raise HTTPException(404, "Assignment not found.")
-    if _as_status_value(assignment.status) != "in_game":
-        raise HTTPException(400, "Only in-game assignments can be completed.")
+
+    user_id = str(current_user["id"])
+    if not _can_manage_court(assignment, user_id, session, db):
+        raise HTTPException(403, "Not authorized. Must be session admin or court manager for this court.")
+
+    if _as_status_value(assignment.status) not in ("in_game", "warming_up"):
+        raise HTTPException(400, "Only in-game or warming-up assignments can be completed.")
 
     winner_side, side1_score, side2_score = _resolve_assignment_completion(session, body)
 
@@ -2289,3 +2512,124 @@ def cancel_session(
     db.commit()
     _publish_open_play_event(session_id, reason="session_cancelled")
     return {"message": "Session cancelled."}
+
+
+# ── Court Manager Delegation ──────────────────────────────────────────────────
+
+@router.get("/open-play/{session_id}/court-managers")
+def list_court_managers(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """List all court managers assigned across courts for this session."""
+    session = _get_session_or_404(session_id, db)
+    if not _is_session_admin(session, str(current_user["id"]), db):
+        raise HTTPException(403, "Not authorized.")
+
+    court_ids = [str(c.id) for c in db.query(OpenPlaySessionCourt).filter(
+        OpenPlaySessionCourt.session_id == session.id
+    ).all()]
+
+    managers = db.query(OpenPlayCourtManager).filter(
+        OpenPlayCourtManager.session_court_id.in_(court_ids)
+    ).all()
+
+    result = []
+    for m in managers:
+        profile = db.query(Profile).filter(Profile.id == m.user_id).first()
+        result.append({
+            "id": str(m.id),
+            "session_court_id": str(m.session_court_id),
+            "user_id": str(m.user_id),
+            "display_name": _display_name(profile),
+            "avatar_url": profile.avatar_url if profile else None,
+            "assigned_at": _iso_utc(m.assigned_at),
+        })
+    return {"managers": result}
+
+
+@router.post("/open-play/{session_id}/courts/{session_court_id}/managers")
+def assign_court_manager(
+    session_id: str,
+    session_court_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Assign a confirmed participant as court manager for a specific court."""
+    session = _get_session_or_404(session_id, db)
+    if not _is_session_admin(session, str(current_user["id"]), db):
+        raise HTTPException(403, "Not authorized.")
+
+    court = db.query(OpenPlaySessionCourt).filter(
+        OpenPlaySessionCourt.id == session_court_id,
+        OpenPlaySessionCourt.session_id == session.id,
+    ).first()
+    if not court:
+        raise HTTPException(404, "Court not found in this session.")
+
+    user_id = (body.get("user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(400, "user_id is required.")
+
+    participant = db.query(OpenPlayParticipant).filter(
+        OpenPlayParticipant.session_id == session.id,
+        OpenPlayParticipant.user_id == user_id,
+        OpenPlayParticipant.status == "confirmed",
+    ).first()
+    if not participant:
+        raise HTTPException(400, "User must be a confirmed participant to be a court manager.")
+
+    existing = db.query(OpenPlayCourtManager).filter(
+        OpenPlayCourtManager.session_court_id == session_court_id,
+        OpenPlayCourtManager.user_id == user_id,
+    ).first()
+    if existing:
+        return {"message": "Already assigned as court manager.", "id": str(existing.id)}
+
+    manager = OpenPlayCourtManager(
+        session_court_id=session_court_id,
+        user_id=user_id,
+        assigned_by=current_user["id"],
+    )
+    db.add(manager)
+    db.commit()
+    db.refresh(manager)
+
+    from app.services.notifications import send_notification
+    send_notification(
+        user_id=user_id,
+        title="Court Manager Role",
+        body=f"You have been assigned as court manager for a court in '{session.title}'.",
+        notif_type="open_play_court_manager",
+        reference_id=str(session.id),
+    )
+    _publish_open_play_event(session_id, reason="court_manager_assigned")
+    return {"message": "Court manager assigned.", "id": str(manager.id)}
+
+
+@router.delete("/open-play/{session_id}/courts/{session_court_id}/managers/{user_id}")
+def remove_court_manager(
+    session_id: str,
+    session_court_id: str,
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Remove a court manager from a specific court."""
+    session = _get_session_or_404(session_id, db)
+    if not _is_session_admin(session, str(current_user["id"]), db):
+        raise HTTPException(403, "Not authorized.")
+
+    manager = db.query(OpenPlayCourtManager).filter(
+        OpenPlayCourtManager.session_court_id == session_court_id,
+        OpenPlayCourtManager.user_id == user_id,
+    ).first()
+    if not manager:
+        raise HTTPException(404, "Court manager not found.")
+
+    db.delete(manager)
+    db.commit()
+    _publish_open_play_event(session_id, reason="court_manager_removed")
+    return {"message": "Court manager removed."}

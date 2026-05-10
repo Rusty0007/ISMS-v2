@@ -27,8 +27,7 @@ services:
       - pgdata:/var/lib/postgresql/data
     command: >
       postgres
-      -c log_statement=all
-      -c log_min_duration_statement=0
+      -c log_min_duration_statement=500
       -c log_destination=stderr
       -c logging_collector=off
     healthcheck:
@@ -116,18 +115,144 @@ services:
     restart: unless-stopped
 
 
-  # ── Production reverse proxy (optional) ─────────────────────────────────
-  # Uncomment when deploying behind Nginx to get correct SSE timeouts.
-  # nginx:
-  #   image: nginx:1.27-alpine
-  #   restart: unless-stopped
-  #   ports:
-  #     - "80:80"
-  #   volumes:
-  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-  #   depends_on:
-  #     - frontend
-  #     - backend
+  # ── Celery worker ────────────────────────────────────────────────────────
+  # Processes background tasks: reminders, feed notifications, and insights.
+  # SMS uses its own worker below so time-critical texts do not wait behind
+  # unrelated queue load.
+  celery-worker:
+    build: ./backend
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      --queues=default,feed,insights
+    volumes:
+      - ./backend:/app
+    env_file: ./backend/.env
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://isms_user:isms_password@db:5432/isms_db
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Dedicated worker for time-critical UniSMS notifications.
+  celery-sms-worker:
+    build: ./backend
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      --queues=sms
+      --hostname=sms@%h
+    volumes:
+      - ./backend:/app
+    env_file: ./backend/.env
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://isms_user:isms_password@db:5432/isms_db
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Celery beat (periodic task scheduler) ────────────────────────────────
+  # Exactly ONE beat process must run at a time — never scale this service.
+  # Sends tasks to the broker on schedule (tournament reminders every 60 s,
+  # open-play expiry every 120 s).
+  celery-beat:
+    build: ./backend
+    command: >
+      celery -A app.celery_app beat
+      --loglevel=info
+      --scheduler celery.beat:PersistentScheduler
+      --schedule /tmp/celerybeat-schedule
+    volumes:
+      - ./backend:/app
+    env_file: ./backend/.env
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://isms_user:isms_password@db:5432/isms_db
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Flower (Celery monitoring UI) ─────────────────────────────────────────
+  # Dashboard at http://localhost:5555 — shows tasks, workers, queues.
+  flower:
+    build: ./backend
+    command: >
+      celery -A app.celery_app flower
+      --port=5555
+      --broker=redis://redis:6379
+    ports:
+      - "5555:5555"
+    env_file: ./backend/.env
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+      celery-worker:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Reverse proxy with rate limiting ────────────────────────────────────────
+  # Handles auth rate limiting, SSE timeouts, security headers.
+  # Access the app via http://localhost (port 80) instead of port 3000/8000.
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      # Uncomment after adding SSL certs to nginx/certs/:
+      # - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Uncomment to enable HTTPS:
+      # - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Automated database backup ─────────────────────────────────────────────
+  # Runs pg_dump daily and stores timestamped backups in ./backups/
+  # Keeps the last 7 days of backups automatically.
+  # Manual trigger: POST /api/admin/backup/trigger
+  db-backup:
+    image: postgis/postgis:15-3.4-alpine
+    restart: unless-stopped
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    environment:
+      PGPASSWORD: isms_password
+      PGHOST: db
+      PGUSER: isms_user
+      PGDATABASE: isms_db
+    entrypoint: ["sh", "-c", "while true; do sh /backup.sh; sleep 86400; done"]
+    depends_on:
+      db:
+        condition: service_healthy
 
 
 volumes:

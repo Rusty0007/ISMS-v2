@@ -1,4 +1,8 @@
+import csv
+import io
+
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sql_text
 from pydantic import BaseModel
@@ -9,8 +13,8 @@ from datetime import date, timedelta, timezone
 import datetime as dt
 
 from app.database import get_db
-from app.models.models import Club, ClubMember, ClubInvite, ClubCheckin, Court, CourtBooking, Profile, Match, PlayerRating
-from sqlalchemy import func
+from app.models.models import Club, ClubMember, ClubInvite, ClubCheckin, Court, CourtBooking, FeedPost, Profile, Match, PlayerRating
+from sqlalchemy import func, or_
 from app.middleware.auth import get_current_user
 from app.services.notifications import send_notification
 
@@ -513,26 +517,47 @@ def join_club(
 @router.get("/{club_id}/members")
 def list_members(
     club_id: str,
+    q:     str = Query("", description="Search by name or email"),
+    page:  int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     club = _club_or_404(db, club_id)
-    members = db.query(ClubMember).filter(ClubMember.club_id == club.id).order_by(ClubMember.joined_at).all()
 
-    result = []
-    for m in members:
-        profile = db.query(Profile).filter(Profile.id == m.user_id).first()
-        result.append({
+    base = (
+        db.query(ClubMember, Profile)
+        .join(Profile, Profile.id == ClubMember.user_id)
+        .filter(ClubMember.club_id == club.id)
+    )
+    if q:
+        like = f"%{q}%"
+        base = base.filter(
+            or_(
+                Profile.first_name.ilike(like),
+                Profile.last_name.ilike(like),
+                Profile.email.ilike(like),
+            )
+        )
+
+    total   = base.count()
+    rows    = base.order_by(ClubMember.joined_at).offset((page - 1) * limit).limit(limit).all()
+
+    result = [
+        {
             "member_id": str(m.id),
-            "user_id": str(m.user_id),
-            "first_name": profile.first_name if profile else None,
-            "last_name": profile.last_name if profile else None,
-            "role": m.role or "member",
-            "duty_date": str(m.duty_date) if m.duty_date is not None else None,
-            "joined_at": str(m.joined_at),
-            "is_admin": m.user_id == club.admin_id,
-        })
-    return result
+            "user_id":   str(m.user_id),
+            "first_name": p.first_name,
+            "last_name":  p.last_name,
+            "email":      p.email,
+            "role":       m.role or "member",
+            "duty_date":  str(m.duty_date) if m.duty_date is not None else None,
+            "joined_at":  str(m.joined_at),
+            "is_admin":   m.user_id == club.admin_id,
+        }
+        for m, p in rows
+    ]
+    return {"members": result, "total": total, "page": page, "limit": limit}
 
 
 @router.delete("/{club_id}/members/{user_id_str}")
@@ -956,3 +981,245 @@ def get_club_rankings(
             for idx, r in enumerate(rows)
         ],
     }
+
+
+# ── Bulk Member Actions ───────────────────────────────────────────────────────
+
+class BulkMemberRequest(BaseModel):
+    user_ids: list[str]
+    action:   str           # "remove" | "set_role"
+    role:     Optional[str] = None   # required when action == "set_role"
+
+
+@router.post("/{club_id}/members/bulk")
+def bulk_member_action(
+    club_id: str,
+    body: BulkMemberRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    club     = _club_or_404(db, club_id)
+    admin_id = uuid.UUID(current_user["id"])
+    _require_admin(club, admin_id)
+
+    if not body.user_ids:
+        raise HTTPException(400, "No user IDs provided.")
+    if body.action not in ("remove", "set_role"):
+        raise HTTPException(400, "action must be 'remove' or 'set_role'.")
+    if body.action == "set_role" and not body.role:
+        raise HTTPException(400, "role is required for set_role action.")
+
+    affected = 0
+    for uid_str in body.user_ids:
+        try:
+            uid = uuid.UUID(uid_str)
+        except ValueError:
+            continue
+        if uid == club.admin_id:
+            continue  # never modify the club owner via bulk
+        member = db.query(ClubMember).filter(
+            ClubMember.club_id == club.id,
+            ClubMember.user_id == uid,
+        ).first()
+        if not member:
+            continue
+        if body.action == "remove":
+            db.delete(member)
+        else:
+            member.role = body.role  # type: ignore[assignment]
+        affected += 1
+
+    db.commit()
+    return {"message": f"Bulk '{body.action}' applied to {affected} member(s).", "affected": affected}
+
+
+# ── Referee Assignment ────────────────────────────────────────────────────────
+
+class AssignRefereeRequest(BaseModel):
+    referee_id: str
+
+
+@router.post("/{club_id}/matches/{match_id}/assign-referee")
+def assign_referee(
+    club_id:  str,
+    match_id: str,
+    body: AssignRefereeRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    club     = _club_or_404(db, club_id)
+    admin_id = uuid.UUID(current_user["id"])
+    _require_admin(club, admin_id)
+
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(404, "Match not found.")
+
+    referee = db.query(Profile).filter(Profile.id == body.referee_id).first()
+    if not referee:
+        raise HTTPException(404, "Referee profile not found.")
+
+    match.referee_id = uuid.UUID(body.referee_id)  # type: ignore[assignment]
+    db.commit()
+
+    send_notification(
+        user_id      = body.referee_id,
+        title        = "Referee Assignment",
+        body         = f"You have been assigned as referee for a match at {club.name}.",
+        notif_type   = "referee_assigned",
+        reference_id = str(match.id),
+    )
+    return {"message": "Referee assigned.", "match_id": match_id, "referee_id": body.referee_id}
+
+
+# ── Announcements ─────────────────────────────────────────────────────────────
+
+class AnnouncementRequest(BaseModel):
+    content:   str
+    image_url: Optional[str] = None
+
+
+@router.post("/{club_id}/announcements", status_code=201)
+def create_announcement(
+    club_id: str,
+    body: AnnouncementRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    club     = _club_or_404(db, club_id)
+    admin_id = uuid.UUID(current_user["id"])
+    _require_admin(club, admin_id)
+
+    if not body.content.strip():
+        raise HTTPException(400, "Announcement content cannot be empty.")
+
+    post = FeedPost(
+        author_id  = admin_id,
+        post_type  = "announcement",
+        content    = body.content.strip(),
+        image_url  = body.image_url,
+        club_id    = club.id,
+    )
+    db.add(post)
+    db.flush()
+
+    # Notify all club members
+    members = db.query(ClubMember).filter(ClubMember.club_id == club.id).all()
+    for m in members:
+        if str(m.user_id) == str(admin_id):
+            continue
+        send_notification(
+            user_id      = str(m.user_id),
+            title        = f"{club.name} — Announcement",
+            body         = body.content[:120],
+            notif_type   = "club_announcement",
+            reference_id = str(post.id),
+        )
+
+    db.commit()
+    return {"message": "Announcement posted.", "post_id": str(post.id)}
+
+
+# ── Export Endpoints ──────────────────────────────────────────────────────────
+
+@router.get("/{club_id}/export/members")
+def export_members_csv(
+    club_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    club     = _club_or_404(db, club_id)
+    admin_id = uuid.UUID(current_user["id"])
+    _require_admin(club, admin_id)
+
+    rows = (
+        db.query(ClubMember, Profile)
+        .join(Profile, Profile.id == ClubMember.user_id)
+        .filter(ClubMember.club_id == club.id)
+        .order_by(ClubMember.joined_at)
+        .all()
+    )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["First Name", "Last Name", "Email", "Role", "Duty Date", "Joined At", "Is Admin"])
+    for m, p in rows:
+        writer.writerow([
+            p.first_name or "",
+            p.last_name  or "",
+            p.email      or "",
+            m.role       or "member",
+            str(m.duty_date) if m.duty_date is not None else "",
+            str(m.joined_at),
+            "Yes" if str(m.user_id) == str(club.admin_id) else "No",
+        ])
+
+    output.seek(0)
+    filename = f"{club.name.replace(' ', '_')}_members.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{club_id}/export/matches")
+def export_matches_csv(
+    club_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    club     = _club_or_404(db, club_id)
+    admin_id = uuid.UUID(current_user["id"])
+    _require_admin(club, admin_id)
+
+    matches = (
+        db.query(Match)
+        .filter(Match.club_id == club.id)
+        .order_by(Match.created_at.desc())
+        .limit(1000)
+        .all()
+    )
+
+    # Batch-fetch player profiles
+    pids = set()
+    for m in matches:
+        for pid in [m.player1_id, m.player2_id, m.player3_id, m.player4_id, m.referee_id]:
+            if pid is not None:
+                pids.add(str(pid))
+    name_map: dict = {}
+    if pids:
+        for p in db.query(Profile.id, Profile.first_name, Profile.last_name).filter(Profile.id.in_(pids)).all():
+            name_map[str(p.id)] = f"{p.first_name or ''} {p.last_name or ''}".strip()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Match ID", "Sport", "Format", "Status",
+        "Player 1", "Player 2", "Player 3", "Player 4",
+        "Referee", "Winner",
+        "Started At", "Completed At",
+    ])
+    for m in matches:
+        sport  = m.sport.value        if hasattr(m.sport,        "value") else str(m.sport)
+        fmt    = m.match_format.value if hasattr(m.match_format, "value") else str(m.match_format)
+        status = m.status.value       if hasattr(m.status,       "value") else str(m.status)
+        writer.writerow([
+            str(m.id), sport, fmt, status,
+            name_map.get(str(m.player1_id), "") if m.player1_id is not None else "",
+            name_map.get(str(m.player2_id), "") if m.player2_id is not None else "",
+            name_map.get(str(m.player3_id), "") if m.player3_id is not None else "",
+            name_map.get(str(m.player4_id), "") if m.player4_id is not None else "",
+            name_map.get(str(m.referee_id),  "") if m.referee_id is not None else "",
+            name_map.get(str(m.winner_id),   "") if m.winner_id is not None else "",
+            str(m.started_at)   if m.started_at is not None   else "",
+            str(m.completed_at) if m.completed_at is not None else "",
+        ])
+
+    output.seek(0)
+    filename = f"{club.name.replace(' ', '_')}_matches.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

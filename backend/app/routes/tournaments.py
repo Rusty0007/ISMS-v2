@@ -1,3 +1,6 @@
+import csv
+import io
+import json
 import uuid
 import asyncio
 import logging
@@ -6,7 +9,7 @@ import random
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
@@ -47,6 +50,23 @@ try:
     _tournament_aredis = _redis_async.from_url(settings.redis_url, decode_responses=True)
 except Exception as _redis_error:
     _tournament_aredis = None
+
+_BRACKET_CACHE_TTL = 30  # seconds
+_ALLOWED_TOURNAMENT_FORMATS = {"double_elimination", "pool_play"}
+
+
+def _format_value(value) -> str:
+    return value.value if hasattr(value, "value") else str(value)
+
+
+def _get_sync_redis():
+    try:
+        import redis as _redis_sync
+        r = _redis_sync.from_url(settings.redis_url, decode_responses=True, socket_timeout=1)
+        r.ping()
+        return r
+    except Exception:
+        return None
     logger.warning(f"[tournament-stream] Redis unavailable - SSE disabled. Reason: {_redis_error}")
 
 
@@ -136,10 +156,13 @@ def _tournament_summary(t: Tournament, reg_count: int = 0) -> dict:
         "max_participants":  t.max_participants,
         "status":            t.status,
         "registration_open": t.registration_open,
+        "access_type":       getattr(t, "access_type", "open") or "open",
+        "exclusive_scope":   getattr(t, "exclusive_scope", "city") or "city",
         "starts_at":         str(t.starts_at) if t.starts_at is not None else None,
         "ends_at":           str(t.ends_at)   if t.ends_at   is not None else None,
         "region_code":          t.region_code,
         "province_code":        t.province_code,
+        "city_mun_code":        getattr(t, "city_mun_code", None),
         "draw_method":          t.draw_method,
         "smart_tiered_config":  t.smart_tiered_config,
         "min_rating":           t.min_rating,
@@ -147,6 +170,11 @@ def _tournament_summary(t: Tournament, reg_count: int = 0) -> dict:
         "requires_approval":    t.requires_approval,
         "knockout_best_of":       getattr(t, "knockout_best_of", 3) or 3,
         "group_stage_best_of":    getattr(t, "group_stage_best_of", 1) or 1,
+        "tournament_mode":        getattr(t, "tournament_mode", "ranked") or "ranked",
+        "third_place_match":      bool(getattr(t, "third_place_match", False)),
+        "wildcard_count":         int(getattr(t, "wildcard_count", 0) or 0),
+        "court_count":            getattr(t, "court_count", None),
+        "match_duration_minutes": int(getattr(t, "match_duration_minutes", 30) or 30),
         "created_at":           str(t.created_at),
         "participant_count":    reg_count,
     }
@@ -160,6 +188,69 @@ def _profile_mini(p: Profile | None) -> dict | None:
         "first_name": p.first_name,
         "last_name":  p.last_name,
         "avatar_url": p.avatar_url,
+    }
+
+
+def _participant_location_distribution(t: Tournament, regs: list, profiles_by_id: dict[str, Profile]) -> dict:
+    venue_region = getattr(t, "region_code", None)
+    venue_province = getattr(t, "province_code", None)
+    venue_city = getattr(t, "city_mun_code", None)
+    confirmed_regs = [r for r in regs if r.status == "confirmed"]
+    if _is_doubles(t.match_format):
+        confirmed_regs = _dedupe_doubles_regs(confirmed_regs)
+
+    buckets = Counter({
+        "same_city": 0,
+        "same_province_other_city": 0,
+        "same_region_other_province": 0,
+        "other_regions": 0,
+        "unknown": 0,
+    })
+    cities = Counter()
+    provinces = Counter()
+    regions = Counter()
+
+    for reg in confirmed_regs:
+        profile = profiles_by_id.get(str(reg.player_id))
+        if profile is None:
+            buckets["unknown"] += 1
+            continue
+
+        region = profile.region_code
+        province = profile.province_code
+        city = profile.city_mun_code
+
+        if city:
+            cities[city] += 1
+        if province:
+            provinces[province] += 1
+        if region:
+            regions[region] += 1
+
+        if not region and not province and not city:
+            buckets["unknown"] += 1
+        elif venue_city and city == venue_city:
+            buckets["same_city"] += 1
+        elif venue_province and province == venue_province:
+            buckets["same_province_other_city"] += 1
+        elif venue_region and region == venue_region:
+            buckets["same_region_other_province"] += 1
+        elif venue_region and region != venue_region:
+            buckets["other_regions"] += 1
+        else:
+            buckets["unknown"] += 1
+
+    return {
+        "venue": {
+            "region_code": venue_region,
+            "province_code": venue_province,
+            "city_mun_code": venue_city,
+        },
+        "total_confirmed": len(confirmed_regs),
+        "buckets": dict(buckets),
+        "by_city_mun_code": [{"code": code, "count": count} for code, count in cities.most_common()],
+        "by_province_code": [{"code": code, "count": count} for code, count in provinces.most_common()],
+        "by_region_code": [{"code": code, "count": count} for code, count in regions.most_common()],
     }
 
 
@@ -462,6 +553,11 @@ def get_tournament(
     all_regs = db.query(TournamentRegistration).filter(
         TournamentRegistration.tournament_id == t.id
     ).all()
+    profile_ids = {str(r.player_id) for r in all_regs if r.player_id is not None}
+    profiles_by_id = {
+        str(p.id): p
+        for p in db.query(Profile).filter(Profile.id.in_(profile_ids)).all()
+    } if profile_ids else {}
 
     is_org = _is_organizer(t, current_user["id"])
 
@@ -471,7 +567,7 @@ def get_tournament(
         # Organizer view: show all (so they can see invited/pending/pending_approval)
         if not is_org and r.status not in ("confirmed",):
             continue
-        profile = db.query(Profile).filter(Profile.id == r.player_id).first()
+        profile = profiles_by_id.get(str(r.player_id))
         entry: dict = {
             "registration_id": str(r.id),
             "player_id":       str(r.player_id),
@@ -479,11 +575,16 @@ def get_tournament(
             "status":          r.status,
             "source":          r.source,
             "registered_at":   str(r.registered_at),
+            "team_name":       getattr(r, "team_name", None),
         }
         if profile:
             entry["first_name"] = profile.first_name
             entry["last_name"]  = profile.last_name
             entry["avatar_url"] = profile.avatar_url
+            entry["region_code"] = profile.region_code
+            entry["province_code"] = profile.province_code
+            entry["city_mun_code"] = profile.city_mun_code
+            entry["barangay_code"] = profile.barangay_code
         if r.partner_id is not None:
             partner = db.query(Profile).filter(Profile.id == r.partner_id).first()
             entry["partner_id"] = str(r.partner_id)
@@ -572,6 +673,7 @@ def get_tournament(
         "tournament":              _tournament_summary(t, confirmed_count),
         "club":                    _tournament_club_summary(db, t, club),
         "registrations":           reg_list,
+        "participant_location_distribution": _participant_location_distribution(t, all_regs, profiles_by_id),
         "is_organizer":            is_org,
         "is_registered":           my_reg is not None,
         "my_reg_id":               str(my_reg.id) if my_reg else None,
@@ -717,6 +819,9 @@ def create_tournament(
         raise HTTPException(400, "Tournament name is required.")
     if not sport:
         raise HTTPException(400, "Sport is required.")
+    tournament_format = body.get("format", "double_elimination")
+    if tournament_format not in _ALLOWED_TOURNAMENT_FORMATS:
+        raise HTTPException(400, "Only Double Elimination and Pool Play + Semifinals formats are available.")
 
     starts_at = None
     ends_at   = None
@@ -732,6 +837,8 @@ def create_tournament(
             pass
 
     draw_method = body.get("draw_method", "random")
+    if draw_method not in ("random", "seeded"):
+        draw_method = "random"
     smart_tiered_config = None
     if draw_method == "smart_tiered":
         smart_tiered_config = {
@@ -742,8 +849,13 @@ def create_tournament(
             "num_candidates":     8,
         }
 
-    min_rating = float(body["min_rating"]) if body.get("min_rating") not in (None, "") else None
-    max_rating = float(body["max_rating"]) if body.get("max_rating") not in (None, "") else None
+    try:
+        min_rating = float(body["min_rating"]) if body.get("min_rating") not in (None, "") else None
+        max_rating = float(body["max_rating"]) if body.get("max_rating") not in (None, "") else None
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Skill rating limits must be valid numbers.")
+    if min_rating is not None and max_rating is not None and min_rating > max_rating:
+        raise HTTPException(400, "Minimum skill rating cannot be higher than maximum skill rating.")
     raw_club_id = body.get("club_id")
     venue_mode = _resolve_venue_mode(body.get("venue_mode"), raw_club_id)
     venue_name = _clean_optional_text(body.get("venue_name"))
@@ -767,12 +879,37 @@ def create_tournament(
         venue_name = None
         venue_address = None
 
+    region_code = body.get("region_code")
+    province_code = body.get("province_code")
+    city_mun_code = body.get("city_mun_code")
+    access_type = body.get("access_type", "open")
+    if access_type not in ("open", "exclusive"):
+        access_type = "open"
+    exclusive_scope = body.get("exclusive_scope", "city")
+    if exclusive_scope not in ("city", "province", "region"):
+        exclusive_scope = "city"
+    if selected_club is not None:
+        region_code = selected_club.region_code
+        province_code = selected_club.province_code
+        city_mun_code = selected_club.city_mun_code
+    if access_type == "exclusive":
+        required_location = {
+            "city": city_mun_code,
+            "province": province_code,
+            "region": region_code,
+        }.get(exclusive_scope)
+        if not required_location:
+            raise HTTPException(
+                400,
+                "Exclusive tournaments need a saved tournament location. Choose a club venue with location details or provide a tournament location.",
+            )
+
     t = Tournament(
         id                  = uuid.uuid4(),
         name                = name,
         description         = body.get("description"),
         sport               = sport,
-        format              = body.get("format", "single_elimination"),
+        format              = tournament_format,
         match_format        = body.get("match_format", "singles"),
         organizer_id        = user_id,
         club_id             = raw_club_id,
@@ -782,17 +919,27 @@ def create_tournament(
         max_participants    = int(body.get("max_participants", 16)),
         status              = "upcoming",
         registration_open   = True,
+        access_type         = access_type,
+        exclusive_scope     = exclusive_scope,
         starts_at           = starts_at,
         ends_at             = ends_at,
-        region_code         = body.get("region_code"),
-        province_code       = body.get("province_code"),
+        region_code         = region_code,
+        province_code       = province_code,
+        city_mun_code       = city_mun_code,
         draw_method         = draw_method,
         smart_tiered_config = smart_tiered_config,
         min_rating          = min_rating,
         max_rating          = max_rating,
-        requires_approval   = bool(body.get("requires_approval", False)),
-        knockout_best_of    = int(body.get("knockout_best_of", 3)) if body.get("knockout_best_of") in (1, 3, "1", "3") else 3,
-        group_stage_best_of = int(body.get("group_stage_best_of", 1)) if body.get("group_stage_best_of") in (1, 3, "1", "3") else 1,
+        requires_approval      = bool(body.get("requires_approval", False)),
+        knockout_best_of       = int(body.get("knockout_best_of", 3)) if body.get("knockout_best_of") in (1, 3, "1", "3") else 3,
+        group_stage_best_of    = int(body.get("group_stage_best_of", 1)) if body.get("group_stage_best_of") in (1, 3, "1", "3") else 1,
+        tournament_mode        = body.get("tournament_mode", "ranked") if body.get("tournament_mode") in ("casual", "ranked", "championship") else "ranked",
+        third_place_match      = bool(body.get("third_place_match", False)),
+        wildcard_count         = max(0, int(body.get("wildcard_count", 0) or 0)),
+        court_count            = int(body.get("court_count")) if body.get("court_count") else (
+            db.query(Court).filter(Court.club_id == selected_club.id).count() if selected_club is not None else None
+        ),
+        match_duration_minutes = max(10, int(body.get("match_duration_minutes", 30) or 30)),
     )
     db.add(t)
     db.commit()
@@ -880,6 +1027,18 @@ def update_tournament(
         setattr(t, "club_id", next_club.id if next_club is not None else None)
         setattr(t, "venue_name", requested_name)
         setattr(t, "venue_address", requested_address)
+        if next_club is not None:
+            setattr(t, "region_code", next_club.region_code)
+            setattr(t, "province_code", next_club.province_code)
+            setattr(t, "city_mun_code", next_club.city_mun_code)
+        elif requested_mode == "external":
+            for field in ("region_code", "province_code", "city_mun_code"):
+                if field in body:
+                    setattr(t, field, body[field])
+        else:
+            setattr(t, "region_code", None)
+            setattr(t, "province_code", None)
+            setattr(t, "city_mun_code", None)
 
     db.commit()
     count = _count_tournament_slots(db, t, ["confirmed"])
@@ -933,6 +1092,23 @@ def register_for_tournament(
         raise HTTPException(400, "Registration is closed.")
     if str(t.status) != "upcoming":
         raise HTTPException(400, "Registration is not available for this tournament.")
+    if (getattr(t, "access_type", "open") or "open") == "exclusive":
+        profile = db.query(Profile).filter(Profile.id == user_id).first()
+        scope = getattr(t, "exclusive_scope", "city") or "city"
+        scope_fields = {
+            "city": ("city_mun_code", "city/municipality"),
+            "province": ("province_code", "province"),
+            "region": ("region_code", "region"),
+        }
+        field_name, label = scope_fields.get(scope, scope_fields["city"])
+        tournament_location = getattr(t, field_name, None)
+        player_location = getattr(profile, field_name, None) if profile else None
+        if not tournament_location:
+            raise HTTPException(400, f"This exclusive tournament has no {label} set yet.")
+        if not player_location:
+            raise HTTPException(403, f"Your ISMS account has no registered {label}. Update your profile location first.")
+        if player_location != tournament_location:
+            raise HTTPException(403, f"This tournament is exclusive to players from the tournament {label}.")
 
     existing = db.query(TournamentRegistration).filter(
         TournamentRegistration.tournament_id == tournament_id,
@@ -1264,6 +1440,17 @@ def accept_partner_invite(
     needs_approval = bool(t.requires_approval)
     final_status   = "pending_approval" if needs_approval else "confirmed"
 
+    # Auto-generate team name if one was not set by the players
+    if not getattr(requester_reg, "team_name", None):
+        requester_profile = db.query(Profile).filter(Profile.id == requester_reg.player_id).first()
+        partner_profile_pre = db.query(Profile).filter(Profile.id == user_id).first()
+        r_last = (requester_profile.last_name or requester_profile.first_name or "Player") if requester_profile else "Player"
+        p_last = (partner_profile_pre.last_name or partner_profile_pre.first_name or "Player") if partner_profile_pre else "Player"
+        auto_name = f"{r_last} / {p_last}"
+        setattr(requester_reg, "team_name", auto_name)
+    else:
+        auto_name = getattr(requester_reg, "team_name")
+
     # Confirm (or pend approval for) requester
     setattr(requester_reg, "status", final_status)
 
@@ -1272,6 +1459,7 @@ def accept_partner_invite(
     if existing:
         setattr(existing, "partner_id", requester_reg.player_id)
         setattr(existing, "status", final_status)
+        setattr(existing, "team_name", auto_name)
     else:
         partner_reg = TournamentRegistration(
             tournament_id = requester_reg.tournament_id,
@@ -1279,6 +1467,7 @@ def accept_partner_invite(
             partner_id    = requester_reg.player_id,
             status        = final_status,
             source        = "self_registered",
+            team_name     = auto_name,
         )
         db.add(partner_reg)
     db.commit()
@@ -1719,6 +1908,19 @@ def _knockout_stage_label(qualifiers: int) -> str:
 
 def _pool_play_options(n: int) -> list[dict]:
     """Return all valid pool configurations for n players."""
+    if n < 4 or n > 12:
+        return []
+    sizes = [6, 6] if n == 12 else [n]
+    pool_matches = sum(s * (s - 1) // 2 for s in sizes)
+    return [{
+        "num_pools": len(sizes),
+        "pool_sizes": sizes,
+        "size_summary": "2x6" if sizes == [6, 6] else f"1x{n}",
+        "pool_matches": pool_matches,
+        "qualifiers": 4,
+        "knockout_stage": "Semifinals",
+        "is_recommended": True,
+    }]
     options = []
     # Valid pool counts: any divisor-ish value where pools have 3–6 players each
     for num_pools in range(2, n // 2 + 1):
@@ -1802,6 +2004,10 @@ def reset_bracket(
     # Revert tournament to upcoming so registration can be re-opened and bracket re-generated
     setattr(t, "status", "upcoming")
     db.commit()
+    redis = _get_sync_redis()
+    if redis:
+        try: redis.delete(f"bracket:{tournament_id}")
+        except Exception: pass
     return {"message": "Bracket reset. You can now reopen registration or regenerate the bracket."}
 
 
@@ -1823,6 +2029,8 @@ def generate_bracket(
         raise HTTPException(400, "Bracket already generated.")
     if bool(t.registration_open):
         raise HTTPException(400, "Close registration before generating the bracket.")
+    if _format_value(t.format) not in _ALLOWED_TOURNAMENT_FORMATS:
+        raise HTTPException(400, "This tournament format is no longer available. Use Double Elimination or Pool Play + Semifinals.")
 
     existing = db.query(Match).filter(Match.tournament_id == tournament_id).first()
     if existing:
@@ -1853,6 +2061,15 @@ def generate_bracket(
     if len(regs) < 2:
         raise HTTPException(400, "Need at least 2 confirmed participants.")
 
+    min_required = 4
+    if len(regs) < min_required:
+        unit = "teams" if _is_doubles(t.match_format) else "players"
+        raise HTTPException(
+            400,
+            f"A tournament requires at least {min_required} confirmed {unit}. "
+            f"Currently have {len(regs)}.",
+        )
+
     # ── Format enforcement before bracket generation ───────────────────────
     if _is_doubles(t.match_format):
         missing = [str(r.player_id) for r in regs if not r.partner_id]
@@ -1879,7 +2096,7 @@ def generate_bracket(
             db.flush()
 
     # ── Smart Tiered Draw ──────────────────────────────────────────────────
-    if t.draw_method == "smart_tiered":
+    if t.draw_method == "smart_tiered" and _format_value(t.format) == "group_stage_knockout":
         player_ids  = [str(r.player_id) for r in regs]
         rating_rows = db.query(PlayerRating).filter(
             PlayerRating.user_id.in_(player_ids),
@@ -1913,17 +2130,26 @@ def generate_bracket(
                                               fairness_scores=dist.scores)
 
     if str(t.format) in ("round_robin", "TournamentFormat.round_robin"):
-        return _generate_round_robin(t, regs, db)
-    if str(t.format) in ("double_elimination", "TournamentFormat.double_elimination"):
-        return _generate_double_elimination(t, regs, db)
-    if str(t.format) in ("group_stage_knockout", "TournamentFormat.group_stage_knockout"):
-        return _generate_group_stage_knockout(t, regs, db)
-    if str(t.format) in ("swiss", "TournamentFormat.swiss"):
-        return _generate_swiss(t, regs, db)
-    if str(t.format) in ("pool_play", "TournamentFormat.pool_play"):
+        result = _generate_round_robin(t, regs, db)
+    elif str(t.format) in ("double_elimination", "TournamentFormat.double_elimination"):
+        result = _generate_double_elimination(t, regs, db)
+    elif str(t.format) in ("group_stage_knockout", "TournamentFormat.group_stage_knockout"):
+        result = _generate_group_stage_knockout(t, regs, db)
+    elif str(t.format) in ("swiss", "TournamentFormat.swiss"):
+        result = _generate_swiss(t, regs, db)
+    elif str(t.format) in ("pool_play", "TournamentFormat.pool_play"):
         num_pools = int((body or {}).get("num_pools", 0)) or None
-        return _generate_pool_play(t, regs, db, num_pools=num_pools)
-    return _generate_single_elimination(t, regs, db)
+        result = _generate_pool_play(t, regs, db, num_pools=num_pools)
+    else:
+        result = _generate_single_elimination(t, regs, db)
+
+    # Invalidate bracket cache so get_bracket returns fresh data immediately
+    redis = _get_sync_redis()
+    if redis:
+        try: redis.delete(f"bracket:{tournament_id}")
+        except Exception: pass
+
+    return result
 
 
 def _generate_single_elimination(t: Tournament, regs: list, db: Session):
@@ -1994,6 +2220,29 @@ def _generate_single_elimination(t: Tournament, regs: list, db: Session):
             setattr(m, "status",     "completed")
             setattr(m, "winner_id",  p2reg.player_id)
             _place_winner_in_next(pos, str(p2reg.player_id), all_matches)
+
+    # ── 3rd-place match (bronze final) ───────────────────────────────────────
+    if bool(getattr(t, "third_place_match", False)) and num_rounds >= 2:
+        bronze = Match(
+            id               = uuid.uuid4(),
+            sport            = t.sport,
+            match_type       = "tournament",
+            match_format     = t.match_format,
+            status           = "pending",
+            tournament_id    = t.id,
+            round_number     = num_rounds,
+            bracket_position = 2,
+            bracket_side     = "3rd",
+        )
+        db.add(bronze)
+        db.flush()
+        # Wire each semifinal loser to this match
+        semi_round = num_rounds - 1
+        semi_count = max(1, size // (2 ** semi_round))
+        for pos in range(1, semi_count + 1):
+            semi = all_matches.get((semi_round, pos))
+            if semi:
+                setattr(semi, "loser_next_match_id", bronze.id)
 
     setattr(t, "status", "registration_closed")
     db.commit()
@@ -2217,9 +2466,17 @@ def _generate_pool_play(t: Tournament, regs: list, db: Session, num_pools: int |
     Otherwise, auto-select a balanced option.
     """
     n = len(regs)
+    if n < 4 or n > 12:
+        raise HTTPException(400, "Pool Play + Semifinals requires 4 to 12 confirmed entries.")
+    required_pools = 2 if n == 12 else 1
+    if num_pools not in (None, 0, required_pools):
+        raise HTTPException(400, f"Pool Play + Semifinals uses {required_pools} pool(s) for {n} entries.")
 
     # ── Resolve num_groups and per-pool sizes ────────────────────────────────
-    if num_pools and num_pools >= 2:
+    if required_pools:
+        num_groups = required_pools
+        sizes = [6, 6] if n == 12 else [n]
+    elif num_pools and num_pools >= 2:
         sizes = _pool_sizes(n, num_pools)
         if min(sizes) < 3 or max(sizes) > 6:
             raise HTTPException(
@@ -2334,11 +2591,54 @@ def _generate_pool_play(t: Tournament, regs: list, db: Session, num_pools: int |
                 db.add(m)
                 pos += 1
 
+    # Knockout placeholders: always semifinals then final.
+    ko_best_of = getattr(t, "knockout_best_of", 3) or 3
+    semifinal_1 = Match(
+        id=uuid.uuid4(),
+        sport=t.sport,
+        match_type="tournament",
+        match_format=t.match_format,
+        status="pending",
+        tournament_id=t.id,
+        round_number=1,
+        bracket_position=1,
+        bracket_side="K",
+        best_of=ko_best_of,
+    )
+    semifinal_2 = Match(
+        id=uuid.uuid4(),
+        sport=t.sport,
+        match_type="tournament",
+        match_format=t.match_format,
+        status="pending",
+        tournament_id=t.id,
+        round_number=1,
+        bracket_position=2,
+        bracket_side="K",
+        best_of=ko_best_of,
+    )
+    final = Match(
+        id=uuid.uuid4(),
+        sport=t.sport,
+        match_type="tournament",
+        match_format=t.match_format,
+        status="pending",
+        tournament_id=t.id,
+        round_number=2,
+        bracket_position=1,
+        bracket_side="K",
+        best_of=ko_best_of,
+    )
+    db.add_all([semifinal_1, semifinal_2, final])
+    db.flush()
+    setattr(semifinal_1, "next_match_id", final.id)
+    setattr(semifinal_2, "next_match_id", final.id)
+
     setattr(t, "status", "registration_closed")
     db.commit()
 
     total_matches = pos - 1
-    qualifiers    = _recommend_qualifiers(n, num_groups)
+    qualifiers    = 4
     cnt           = Counter(sizes)
     size_summary  = " · ".join(f"{cnt[s]}×{s}" if cnt[s] > 1 else str(s) for s in sorted(cnt.keys(), reverse=True))
     return {
@@ -2477,8 +2777,8 @@ def promote_to_knockout(
         raise HTTPException(403, "Not authorized.")
 
     fmt = str(t.format)
-    if "group_stage_knockout" not in fmt:
-        raise HTTPException(400, "Promote-to-knockout is only available for Group Stage + Knockout tournaments.")
+    if "group_stage_knockout" not in fmt and "pool_play" not in fmt:
+        raise HTTPException(400, "Promote-to-knockout is only available for Pool Play tournaments.")
 
     if str(t.status) not in ("ongoing", "registration_closed"):
         raise HTTPException(400, "Tournament must be ongoing or registration closed to promote to knockout.")
@@ -2511,9 +2811,11 @@ def promote_to_knockout(
     # ── Gather top 2 from each group (by bracket_side G0, G1, …) ────────────
     # Group matches are keyed by their bracket_side (G0, G1, …)
     sides: set[str] = {getattr(m, "bracket_side", "") for m in group_matches}
+    advance_per_group = 4 if "pool_play" in fmt and len(sides) == 1 else 2
 
     # Build standings per group from match results
     qualified_player_ids: list[str] = []
+    _wildcard_pool_entries: list[tuple[str, int, int]] = []  # (player_id, wins, point_diff)
 
     for side in sorted(sides):
         side_matches = [m for m in group_matches if getattr(m, "bracket_side", "") == side]
@@ -2547,14 +2849,55 @@ def promote_to_knockout(
                 pdiff_map[winner_str] = pdiff_map.get(winner_str, 0) + (p2_pts - p1_pts)
                 pdiff_map[loser_str]  = pdiff_map.get(loser_str,  0) + (p1_pts - p2_pts)
 
-        # Sort: wins desc → point_diff desc → random tiebreak
-        ranked = sorted(
-            player_ids_in_group,
-            key=lambda pid: (-wins_map.get(pid, 0), -pdiff_map.get(pid, 0), random.random()),
-        )
-        # Take top 2 (or top 1 if group has only 2 players)
-        advance = ranked[:2] if len(ranked) >= 2 else ranked[:1]
+        # Build head-to-head win map for tiebreaking
+        h2h_map: dict[str, dict[str, int]] = {pid: {} for pid in player_ids_in_group}
+        for m in side_matches:
+            if not m.winner_id:
+                continue
+            winner_str = str(m.winner_id)
+            loser_str  = str(m.player1_id) if winner_str == str(m.player2_id) else str(m.player2_id)
+            h2h_map[winner_str][loser_str] = h2h_map[winner_str].get(loser_str, 0) + 1
+
+        # Sort: wins desc → point_diff desc → head-to-head desc → random
+        def _sort_key(pid: str):
+            return (
+                -wins_map.get(pid, 0),
+                -pdiff_map.get(pid, 0),
+                random.random(),  # final tiebreak (h2h handled via cmp below)
+            )
+
+        ranked_ids = list(player_ids_in_group)
+
+        import functools
+
+        def _cmp(a: str, b: str) -> int:
+            if wins_map.get(a, 0) != wins_map.get(b, 0):
+                return -1 if wins_map[a] > wins_map[b] else 1
+            if pdiff_map.get(a, 0) != pdiff_map.get(b, 0):
+                return -1 if pdiff_map[a] > pdiff_map[b] else 1
+            # head-to-head: how many times did a beat b vs b beat a?
+            a_beat_b = h2h_map.get(a, {}).get(b, 0)
+            b_beat_a = h2h_map.get(b, {}).get(a, 0)
+            if a_beat_b != b_beat_a:
+                return -1 if a_beat_b > b_beat_a else 1
+            return 0
+
+        ranked = sorted(ranked_ids, key=functools.cmp_to_key(_cmp))
+        advance = ranked[:advance_per_group]
         qualified_player_ids.extend(advance)
+
+        # Collect non-advancing players for wildcard pool
+        non_advancing = ranked[len(advance):]
+        for pid in non_advancing:
+            _wildcard_pool_entries.append((pid, wins_map.get(pid, 0), pdiff_map.get(pid, 0)))
+
+    # ── Wildcard spots ───────────────────────────────────────────────────────
+    wildcard_count = 0 if "pool_play" in fmt else int(getattr(t, "wildcard_count", 0) or 0)
+    if wildcard_count > 0 and _wildcard_pool_entries:
+        _wildcard_pool_entries.sort(key=lambda x: (-x[1], -x[2]))
+        for pid, _, _ in _wildcard_pool_entries[:wildcard_count]:
+            if pid not in qualified_player_ids:
+                qualified_player_ids.append(pid)
 
     if len(qualified_player_ids) < 2:
         raise HTTPException(400, "Not enough players qualified for knockout stage.")
@@ -2572,7 +2915,23 @@ def promote_to_knockout(
     db.flush()
 
     # ── Randomly reshuffle qualified players ─────────────────────────────────
-    random.shuffle(qualified_player_ids)
+    if "pool_play" in fmt and len(qualified_player_ids) == 4:
+        if len(sides) == 1:
+            qualified_player_ids = [
+                qualified_player_ids[0],
+                qualified_player_ids[3],
+                qualified_player_ids[1],
+                qualified_player_ids[2],
+            ]
+        else:
+            qualified_player_ids = [
+                qualified_player_ids[0],
+                qualified_player_ids[3],
+                qualified_player_ids[2],
+                qualified_player_ids[1],
+            ]
+    else:
+        random.shuffle(qualified_player_ids)
 
     # ── Build single-elimination knockout bracket ─────────────────────────────
     n        = len(qualified_player_ids)
@@ -2702,6 +3061,17 @@ def get_bracket(
     if not t:
         raise HTTPException(404, "Tournament not found.")
 
+    # Serve from cache when available (invalidated on bracket generate/reset)
+    cache_key = f"bracket:{tournament_id}"
+    redis = _get_sync_redis()
+    if redis:
+        try:
+            cached = redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
+
     dispatch_due_tournament_match_reminders(db, tournament_id)
 
     matches = db.query(Match).filter(
@@ -2822,7 +3192,8 @@ def get_bracket(
 
     # ── DE / Group-stage: group by bracket_side then round ───────────────────
     if fmt in ("double_elimination", "TournamentFormat.double_elimination",
-               "group_stage_knockout", "TournamentFormat.group_stage_knockout"):
+               "group_stage_knockout", "TournamentFormat.group_stage_knockout",
+               "pool_play", "TournamentFormat.pool_play"):
         sections: dict[str, dict[int, list]] = {}
         for m in matches:
             side  = getattr(m, "bracket_side", None) or "W"
@@ -2863,11 +3234,15 @@ def get_bracket(
             )
             result_sections.append({"section": side, "label": section_label, "rounds": rounds_list})
 
-        return {
+        payload = {
             "tournament": _tournament_summary(t),
             "sections":   result_sections,
             "format":     fmt,
         }
+        if redis:
+            try: redis.setex(cache_key, _BRACKET_CACHE_TTL, json.dumps(payload))
+            except Exception: pass
+        return payload
 
     # ── Single elimination / Round robin ─────────────────────────────────────
     rounds: dict[int, list] = {}
@@ -2883,11 +3258,15 @@ def get_bracket(
         label = round_labels.get(reverse_r, f"Round {r}")
         result.append({"round": r, "label": label, "matches": rounds[r]})
 
-    return {
+    payload = {
         "tournament": _tournament_summary(t),
         "rounds":     result,
         "format":     fmt,
     }
+    if redis:
+        try: redis.setex(cache_key, _BRACKET_CACHE_TTL, json.dumps(payload))
+        except Exception: pass
+    return payload
 
 
 # Tournament officiating helpers
@@ -3729,22 +4108,24 @@ def call_tournament_match(
     player_ids = _participant_ids(match, include_referee=False)
     referee_id = str(match.referee_id) if match.referee_id is not None else None
 
+    court_clause = f" to {court_name}" if court_name else ""
+
     if player_ids:
         send_bulk_notifications(
             user_ids=player_ids,
             title="Match Called To Court",
-            body=f"Your match has been called{f' to {court_name}' if court_name else ''}. Please enter the match lobby now.",
+            body=f"[{t.name}] Your match has been called{court_clause}. Please proceed to the venue and enter the match lobby now.",
             notif_type="tournament_match_called",
             reference_id=match_id,
         )
 
     if referee_id:
         referee_body = (
-            f"{caller_name} called a match{f' to {court_name}' if court_name else ''}."
-            " Please go to the referee console and start the match when all players are in."
+            f"[{t.name}] {caller_name} is calling a match{court_clause}."
+            " Please proceed to the venue and open the referee console. Players are warming up."
             if referee_id != current_user["id"]
-            else f"Your match has been called{f' to {court_name}' if court_name else ''}."
-            " Open the referee console once all players have entered the lobby."
+            else f"[{t.name}] Your match has been called{court_clause}."
+            " Proceed to the venue and open the referee console once all players have entered the lobby."
         )
         send_bulk_notifications(
             user_ids=[referee_id],
@@ -3802,9 +4183,9 @@ def notify_referee(
         user_ids=[referee_id],
         title="Referee — Please Enter the Lobby",
         body=(
-            f"{caller_name} is asking you to enter the match lobby"
+            f"[{t.name}] {caller_name} is asking you to enter the match lobby"
             f"{f' on {court_name}' if court_name else ''}."
-            " Players are waiting."
+            " Players are at the venue and waiting."
         ),
         notif_type="tournament_match_called",
         reference_id=match_id,
@@ -4404,6 +4785,9 @@ def organizer_submit_score(
         ))
     db.flush()
 
+    # Casual tournaments skip Glicko-2 updates entirely
+    _is_casual = (getattr(t, "tournament_mode", "ranked") or "ranked") == "casual"
+
     # Complete via stored procedure (updates ratings + advances bracket)
     p1_id = str(m.player1_id)
     p2_id = str(m.player2_id)
@@ -4440,7 +4824,7 @@ def organizer_submit_score(
 
     p1_wins = (body.winner_id == p1_id)
     partner_updates: tuple | None = None
-    if p1_rating and p2_rating:
+    if p1_rating and p2_rating and not _is_casual:
         if is_doubles_match and p3_rating and p4_rating:
             team1_avg_r = (float(p1_rating.rating) + float(p3_rating.rating)) / 2
             team1_avg_rd = math.sqrt((float(p1_rating.rating_deviation) ** 2 + float(p3_rating.rating_deviation) ** 2) / 2)
@@ -4631,6 +5015,12 @@ def organizer_submit_score(
         tournament_phase="result_pending",
     )
 
+    try:
+        from app.services.auto_insight import schedule_auto_insight
+        schedule_auto_insight(p1_id, p2_id, p3_id or "", p4_id or "")
+    except Exception:
+        pass
+
     return {"message": "Score submitted and bracket advanced."}
 
 
@@ -4800,3 +5190,197 @@ def get_pool_groups(
         })
 
     return result
+
+
+# ── Tournament Exports ────────────────────────────────────────────────────────
+
+@router.get("/{tournament_id}/export/participants")
+def export_participants_csv(
+    tournament_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Download participant list as CSV. Available to tournament organizer only."""
+    t = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+    if not t:
+        raise HTTPException(404, "Tournament not found.")
+    if not _is_organizer(t, current_user["id"]):
+        raise HTTPException(403, "Only the tournament organizer can export data.")
+
+    regs = (
+        db.query(TournamentRegistration)
+        .filter(TournamentRegistration.tournament_id == tournament_id)
+        .order_by(TournamentRegistration.registered_at)
+        .all()
+    )
+
+    pids = {str(r.player_id) for r in regs} | {str(r.partner_id) for r in regs if r.partner_id}
+    profiles: dict[str, Profile] = {}
+    if pids:
+        for p in db.query(Profile).filter(Profile.id.in_(pids)).all():
+            profiles[str(p.id)] = p
+
+    is_dbl = _is_doubles(str(t.match_format))
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    if is_dbl:
+        writer.writerow(["Seed", "Team Name", "Player 1", "Player 2", "Status", "Registered At"])
+        for reg in regs:
+            p1 = profiles.get(str(reg.player_id))
+            p2 = profiles.get(str(reg.partner_id)) if reg.partner_id else None
+            writer.writerow([
+                reg.seed or "",
+                reg.team_name or "",
+                f"{p1.first_name or ''} {p1.last_name or ''}".strip() if p1 else str(reg.player_id)[:8],
+                f"{p2.first_name or ''} {p2.last_name or ''}".strip() if p2 else "",
+                reg.status,
+                str(reg.registered_at),
+            ])
+    else:
+        writer.writerow(["Seed", "First Name", "Last Name", "Status", "Registered At"])
+        for reg in regs:
+            p = profiles.get(str(reg.player_id))
+            writer.writerow([
+                reg.seed or "",
+                p.first_name or "" if p else "",
+                p.last_name  or "" if p else str(reg.player_id)[:8],
+                reg.status,
+                str(reg.registered_at),
+            ])
+
+    output.seek(0)
+    safe_name = str(t.name).replace(" ", "_")
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_participants.csv"'},
+    )
+
+
+@router.get("/{tournament_id}/export/results")
+def export_results_csv(
+    tournament_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Download match results as CSV. Available to tournament organizer only."""
+    t = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+    if not t:
+        raise HTTPException(404, "Tournament not found.")
+    if not _is_organizer(t, current_user["id"]):
+        raise HTTPException(403, "Only the tournament organizer can export data.")
+
+    matches = (
+        db.query(Match)
+        .filter(Match.tournament_id == tournament_id)
+        .order_by(Match.round_number, Match.bracket_position)
+        .all()
+    )
+
+    pids: set[str] = set()
+    for m in matches:
+        for pid in [m.player1_id, m.player2_id, m.winner_id, m.referee_id]:
+            if pid:
+                pids.add(str(pid))
+    profiles: dict[str, Profile] = {}
+    if pids:
+        for p in db.query(Profile).filter(Profile.id.in_(pids)).all():
+            profiles[str(p.id)] = p
+
+    def _name(pid) -> str:  # type: ignore[no-untyped-def]
+        if not pid:
+            return ""
+        p = profiles.get(str(pid))
+        return f"{p.first_name or ''} {p.last_name or ''}".strip() if p else str(pid)[:8]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Round", "Position", "Bracket Side",
+        "Player 1", "Player 2", "Winner",
+        "Status", "Referee", "Started At", "Completed At",
+    ])
+    for m in matches:
+        status = m.status.value if hasattr(m.status, "value") else str(m.status)
+        writer.writerow([
+            m.round_number or "",
+            m.bracket_position or "",
+            getattr(m, "bracket_side", "") or "",
+            _name(m.player1_id),
+            _name(m.player2_id),
+            _name(m.winner_id),
+            status,
+            _name(m.referee_id),
+            str(m.started_at)   if m.started_at   else "",
+            str(m.completed_at) if m.completed_at else "",
+        ])
+
+    output.seek(0)
+    safe_name = str(t.name).replace(" ", "_")
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_results.csv"'},
+    )
+
+
+# ── Tournament Recovery Tool ──────────────────────────────────────────────────
+
+@router.post("/{tournament_id}/recover")
+def recover_tournament(
+    tournament_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Recovery tool: finds matches stuck in 'ongoing' for 90+ minutes and resets
+    them to 'pending' so they can be re-called. Releases held courts.
+    """
+    t = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+    if not t:
+        raise HTTPException(404, "Tournament not found.")
+    if not _is_organizer(t, current_user["id"]):
+        raise HTTPException(403, "Only the tournament organizer can run recovery.")
+
+    now = datetime.now(timezone.utc)
+    stuck_threshold_minutes = 90
+
+    stuck_matches = (
+        db.query(Match)
+        .filter(
+            Match.tournament_id == tournament_id,
+            Match.status == "ongoing",
+            Match.started_at.isnot(None),
+        )
+        .all()
+    )
+
+    reset_count = 0
+    for m in stuck_matches:
+        started = m.started_at
+        if started and started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = (now - started).total_seconds() / 60 if started else 0
+        if elapsed >= stuck_threshold_minutes:
+            setattr(m, "status", "pending")
+            setattr(m, "started_at", None)
+            if m.court_id:
+                court = db.query(Court).filter(Court.id == m.court_id).first()
+                if court:
+                    setattr(court, "status", "available")
+            reset_count += 1
+
+    if reset_count > 0:
+        db.commit()
+
+    redis = _get_sync_redis()
+    if redis:
+        try: redis.delete(f"bracket:{tournament_id}")
+        except Exception: pass
+
+    return {
+        "message": f"Recovery complete. {reset_count} stuck match(es) reset to pending.",
+        "reset_count": reset_count,
+        "threshold_minutes": stuck_threshold_minutes,
+    }

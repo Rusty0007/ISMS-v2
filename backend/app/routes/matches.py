@@ -1,7 +1,7 @@
 import logging
 from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
-from typing import Optional, cast
+from typing import Any, Optional, cast
 from datetime import datetime, timezone, timedelta
 import asyncio
 import json
@@ -24,6 +24,7 @@ from app.utils.glicko2 import update as glicko_update
 from app.config import settings
 from app.services.training_data_collector import save_training_row
 from app.services.matchmaking import (
+    DEFAULT_MATCHMAKING_RATING,
     find_best_opponent,
     get_model_info,
     score_candidate,
@@ -73,6 +74,68 @@ def _profile_display_name(db: Session, player_id: str | None) -> str | None:
         return str(player_id)[:8]
     full_name = f"{profile.first_name or ''} {profile.last_name or ''}".strip()
     return full_name or str(player_id)[:8]
+
+
+def _profile_name_map(db: Session, player_ids: list[str]) -> dict[str, str]:
+    unique_ids = sorted({pid for pid in player_ids if pid})
+    if not unique_ids:
+        return {}
+
+    profiles = db.query(Profile).filter(Profile.id.in_(unique_ids)).all()
+    names: dict[str, str] = {}
+    for profile in profiles:
+        full_name = f"{profile.first_name or ''} {profile.last_name or ''}".strip()
+        names[str(profile.id)] = full_name or str(profile.id)[:8]
+    return names
+
+
+def _match_player_ids(match: Match) -> list[str]:
+    raw_ids = [
+        match.player1_id,
+        match.player2_id,
+        match.player3_id,
+        match.player4_id,
+        match.team1_player1,
+        match.team1_player2,
+        match.team2_player1,
+        match.team2_player2,
+    ]
+    player_ids: list[str] = []
+    for pid in raw_ids:
+        if pid is not None and str(pid) not in player_ids:
+            player_ids.append(str(pid))
+    return player_ids
+
+
+def _match_team_ids(match: Match) -> tuple[list[str], list[str]]:
+    team1_raw = [match.team1_player1, match.team1_player2] if match.team1_player1 is not None else [match.player1_id, match.player3_id]
+    team2_raw = [match.team2_player1, match.team2_player2] if match.team2_player1 is not None else [match.player2_id, match.player4_id]
+    team1 = [str(pid) for pid in team1_raw if pid is not None]
+    team2 = [str(pid) for pid in team2_raw if pid is not None]
+    return team1, team2
+
+
+def _serialize_match_sets(sets: list[MatchSet]) -> list[dict]:
+    serialized: list[dict] = []
+    for match_set in sets:
+        team1_score = match_set.team1_score if match_set.team1_score is not None else match_set.player1_score
+        team2_score = match_set.team2_score if match_set.team2_score is not None else match_set.player2_score
+        serialized.append({
+            "set_number": match_set.set_number,
+            "team1_score": team1_score,
+            "team2_score": team2_score,
+        })
+    return serialized
+
+
+def _final_score_label(serialized_sets: list[dict]) -> str | None:
+    completed_sets = [
+        match_set for match_set in serialized_sets
+        if match_set.get("team1_score") is not None and match_set.get("team2_score") is not None
+    ]
+    if not completed_sets:
+        return None
+    return ", ".join(f"{s['team1_score']}-{s['team2_score']}" for s in completed_sets)
 
 
 def _as_aware_utc(dt: datetime | None) -> datetime | None:
@@ -188,9 +251,9 @@ def _refresh_rating_eligibility(db: Session, user_ids: list[str], sport: str, ma
         if rating is None:
             continue
 
-        matches_played = int(rating.matches_played or 0)
+        matches_played = _model_int(rating, "matches_played")
         distinct_opponents = _count_distinct_opponents(db, user_id, sport, match_format)
-        rd = float(rating.rating_deviation or 999.0)
+        rd = float(rating.rating_deviation or 999.0)  # type: ignore[arg-type]
         matchmaking_ready = matchmaking_eligible(matches_played)
         leaderboard_ready = leaderboard_eligible(matches_played, distinct_opponents, rd)
 
@@ -575,9 +638,21 @@ VALID_EVENTS  = ["shot", "violation", "rally_outcome", "momentum"]
 
 
 def _safe_win_rate(rating: PlayerRating | None, default: float = 0.5) -> float:
-    if rating is None or int(rating.matches_played or 0) <= 0:  # type: ignore[arg-type]
+    matches_played = _model_int(rating, "matches_played")
+    if rating is None or matches_played <= 0:
         return default
-    return float(int(rating.wins or 0)) / float(int(rating.matches_played or 1))  # type: ignore[arg-type]
+    return float(_model_int(rating, "wins")) / float(matches_played)
+
+
+def _model_int(model: Any, field: str, default: int = 0) -> int:
+    """Read SQLAlchemy scalar integer fields without exposing Column types to Pylance."""
+    if model is None:
+        return default
+    raw = getattr(model, field, default)
+    try:
+        return int(raw or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _profile_gender_key(profile: Profile | None) -> str | None:
@@ -602,7 +677,7 @@ def _resolve_match_mode(match: Match) -> str:
 def _normalize_queue_mode(raw_mode: str | None) -> str:
     mode = (raw_mode or "ranked").strip().lower()
     if mode in ("normal", "quick", "friendly"):
-        return "quick"
+        return "normal"
     if mode in ("ranked", "club"):
         return "ranked"
     return "ranked"
@@ -652,14 +727,6 @@ def _ordered_club_overlap(*club_lists: list[str]) -> list[str]:
             return []
 
     return [club_id for club_id in club_lists[0] if club_id in common]
-
-
-def _match_player_ids(match: Match) -> list[str]:
-    return [
-        str(pid)
-        for pid in [match.player1_id, match.player2_id, match.player3_id, match.player4_id]
-        if pid is not None
-    ]
 
 
 def _get_match_candidate_club_ids(db: Session, match: Match, sport: str) -> list[str]:
@@ -822,6 +889,7 @@ def create_friendly_match(
         match_format=data.match_format, status="pending",
         player1_id=player1_id, player2_id=data.opponent_id,
         ml_match_score=ml_score,
+        best_of=1,
     )
     db.add(match)
     db.flush()
@@ -968,6 +1036,22 @@ def join_queue(
             raise HTTPException(403, "You are not a member of that club.")
         preferred_club_id = club_uuid
 
+    # ── Ranked eligibility gate ───────────────────────────────────────────────
+    if data.match_mode == "ranked":
+        rank_rating = db.query(PlayerRating).filter(
+            PlayerRating.user_id == user_id,
+            PlayerRating.sport == data.sport,
+            PlayerRating.match_format == data.match_format,
+        ).first()
+        matches_played = _model_int(rank_rating, "matches_played")
+        if matches_played < ML_MATCHMAKING_MIN_MATCHES:
+            remaining = ML_MATCHMAKING_MIN_MATCHES - matches_played
+            raise HTTPException(
+                400,
+                f"Ranked mode requires {ML_MATCHMAKING_MIN_MATCHES} completed matches. "
+                f"You have {matches_played} — play {remaining} more Normal match{'es' if remaining > 1 else ''} to unlock Ranked."
+            )
+
     # ── Validate match_mode ────────────────────────────────────────────────────
     match_mode = requested_mode
     search_club_ids: list[str] = []
@@ -1002,11 +1086,13 @@ def join_queue(
         resolved_region   = data.play_region_code   or (my_profile.region_code    if my_profile else None)
 
         my_player = {
-            "rating":           float(my_rating.rating)             if my_rating else 1500.0,  # type: ignore[arg-type]
+            "rating":           float(my_rating.rating)             if my_rating else DEFAULT_MATCHMAKING_RATING,  # type: ignore[arg-type]
             "rating_deviation": float(my_rating.rating_deviation)   if my_rating else 200.0,  # type: ignore[arg-type]
             "win_rate":         _safe_win_rate(my_rating),
             "activeness_score": float(my_rating.activeness_score)   if my_rating else 0.5,  # type: ignore[arg-type]
             "current_streak":   float(my_rating.current_win_streak) if my_rating else 0.0,  # type: ignore[arg-type]
+            "matches_played":   _model_int(my_rating, "matches_played"),
+            "is_unrated":       _model_int(my_rating, "matches_played") <= 0,
             "city_code":        resolved_city,
             "province_code":    resolved_province,
             "region_code":      resolved_region,
@@ -1083,11 +1169,13 @@ def join_queue(
             candidates.append({
                 "player_id":          opp_id,
                 "match_id":           str(queued.id),
-                "rating":             float(opp_r.rating)             if opp_r else 1200.0,  # type: ignore[arg-type]
+                "rating":             float(opp_r.rating)             if opp_r else DEFAULT_MATCHMAKING_RATING,  # type: ignore[arg-type]
                 "rating_deviation":   float(opp_r.rating_deviation)   if opp_r else 200.0,  # type: ignore[arg-type]
                 "win_rate":           _safe_win_rate(opp_r),
                 "activeness_score":   float(opp_r.activeness_score)   if opp_r else 0.5,  # type: ignore[arg-type]
                 "current_streak":     float(opp_r.current_win_streak) if opp_r else 0.0,  # type: ignore[arg-type]
+                "matches_played":     _model_int(opp_r, "matches_played"),
+                "is_unrated":         _model_int(opp_r, "matches_played") <= 0,
                 "city_code":          cand_city,
                 "province_code":      cand_province,
                 "region_code":        cand_region,
@@ -1136,7 +1224,7 @@ def join_queue(
                         if _requires_club_match_approval(club_obj):
                             setattr(found, "status", "pending_approval")
                             needs_approval = True
-                            _notify_duty_holders(db, avail.club_id, found.id, str(club_obj.name))
+                            _notify_duty_holders(db, avail.club_id, found.id, str(club_obj.name) if club_obj is not None else "")
                 if my_profile is not None and my_boost:
                     setattr(my_profile, "referee_boost_until", None)
                 db.commit()
@@ -1159,6 +1247,7 @@ def join_queue(
             queue_city_code=resolved_city,
             queue_province_code=resolved_province,
             queue_region_code=resolved_region,
+            best_of=1,
         )
         db.add(new_match)
         if my_profile is not None and my_boost:
@@ -1188,11 +1277,13 @@ def join_queue(
         _require_supported_mixed_doubles_gender(_doubles_p)
     my_player_doubles = {
         "player_id":         user_id,
-        "rating":           float(_doubles_r.rating)           if _doubles_r else 1500.0,  # type: ignore[arg-type]
+        "rating":           float(_doubles_r.rating)           if _doubles_r else DEFAULT_MATCHMAKING_RATING,  # type: ignore[arg-type]
         "rating_deviation": float(_doubles_r.rating_deviation) if _doubles_r else 200.0,   # type: ignore[arg-type]
         "win_rate":         _safe_win_rate(_doubles_r),
         "activeness_score": float(_doubles_r.activeness_score) if _doubles_r else 0.5,     # type: ignore[arg-type]
         "current_streak":   int(_doubles_r.current_win_streak) if _doubles_r else 0,       # type: ignore[arg-type]
+        "matches_played":   _model_int(_doubles_r, "matches_played"),
+        "is_unrated":       _model_int(_doubles_r, "matches_played") <= 0,
         "performance_rating": float(_doubles_r.performance_rating) if _doubles_r and _doubles_r.performance_rating is not None else 50.0,  # type: ignore[arg-type]
         "performance_confidence": float(_doubles_r.performance_confidence) if _doubles_r and _doubles_r.performance_confidence is not None else 0.0,  # type: ignore[arg-type]
         "performance_reliable": bool(_doubles_r.performance_reliable) if _doubles_r else False,
@@ -1251,11 +1342,13 @@ def join_queue(
                 p = db.query(Profile).filter(Profile.id == pid).first()
                 player_stats.append({
                     "player_id": pid,
-                    "rating": float(r.rating) if r else 1200.0,  # type: ignore[arg-type]
+                    "rating": float(r.rating) if r else DEFAULT_MATCHMAKING_RATING,  # type: ignore[arg-type]
                     "rating_deviation": float(r.rating_deviation) if r else 200.0,  # type: ignore[arg-type]
                     "win_rate": _safe_win_rate(r),
                     "activeness_score": float(r.activeness_score) if r else 0.5,  # type: ignore[arg-type]
                     "current_streak": int(r.current_win_streak) if r else 0,  # type: ignore[arg-type]
+                    "matches_played": _model_int(r, "matches_played"),
+                    "is_unrated": _model_int(r, "matches_played") <= 0,
                     "performance_rating": float(r.performance_rating) if r and r.performance_rating is not None else 50.0,  # type: ignore[arg-type]
                     "performance_confidence": float(r.performance_confidence) if r and r.performance_confidence is not None else 0.0,  # type: ignore[arg-type]
                     "performance_reliable": bool(r.performance_reliable) if r else False,
@@ -1336,7 +1429,7 @@ def join_queue(
                             setattr(candidate, "started_at", datetime.now(timezone.utc))
                             db.add(MatchSet(match_id=candidate.id, set_number=1, player1_score=0, player2_score=0))
                             needs_approval = True
-                            _notify_duty_holders(db, avail.club_id, candidate.id, str(club_obj.name))
+                            _notify_duty_holders(db, avail.club_id, candidate.id, str(club_obj.name) if club_obj is not None else "")
 
                 if not needs_approval:
                     setattr(candidate, "status", "awaiting_players")
@@ -1367,11 +1460,13 @@ def join_queue(
                 ).first()
                 ep = db.query(Profile).filter(Profile.id == pid).first()
                 existing_stats.append({
-                    "rating":           float(er.rating)           if er else 1200.0,  # type: ignore[arg-type]
+                    "rating":           float(er.rating)           if er else DEFAULT_MATCHMAKING_RATING,  # type: ignore[arg-type]
                     "rating_deviation": float(er.rating_deviation) if er else 200.0,   # type: ignore[arg-type]
                     "win_rate":         _safe_win_rate(er),
                     "activeness_score": float(er.activeness_score) if er else 0.5,     # type: ignore[arg-type]
                     "current_streak":   int(er.current_win_streak) if er else 0,       # type: ignore[arg-type]
+                    "matches_played":   _model_int(er, "matches_played"),
+                    "is_unrated":       _model_int(er, "matches_played") <= 0,
                     "performance_rating": float(er.performance_rating) if er and er.performance_rating is not None else 50.0,  # type: ignore[arg-type]
                     "performance_confidence": float(er.performance_confidence) if er and er.performance_confidence is not None else 0.0,  # type: ignore[arg-type]
                     "performance_reliable": bool(er.performance_reliable) if er else False,
@@ -1422,6 +1517,7 @@ def join_queue(
         match_format=data.match_format, status="assembling",
         player1_id=user_id,
         club_id=preferred_club_id,
+        best_of=1,
     )
     db.add(new_match)
     db.commit()
@@ -1712,6 +1808,7 @@ def book_match(
         match_format=data.match_format, status="pending",
         player1_id=player1_id, player2_id=data.opponent_id,
         scheduled_at=data.scheduled_at,
+        best_of=1,
     )
     db.add(match)
     db.commit()
@@ -1766,10 +1863,35 @@ def get_my_matches(
         or_(
             Match.player1_id == user_id, Match.player2_id == user_id,
             Match.player3_id == user_id, Match.player4_id == user_id,
+            Match.team1_player1 == user_id, Match.team1_player2 == user_id,
+            Match.team2_player1 == user_id, Match.team2_player2 == user_id,
         )
     ).order_by(Match.created_at.desc()).all()
 
+    match_ids = [str(m.id) for m in matches]
+    sets_by_match: dict[str, list[MatchSet]] = {match_id: [] for match_id in match_ids}
+    if match_ids:
+        match_sets = (
+            db.query(MatchSet)
+            .filter(MatchSet.match_id.in_(match_ids))
+            .order_by(MatchSet.match_id, MatchSet.set_number)
+            .all()
+        )
+        for match_set in match_sets:
+            sets_by_match.setdefault(str(match_set.match_id), []).append(match_set)
+
+    name_map = _profile_name_map(
+        db,
+        [pid for match in matches for pid in _match_player_ids(match)],
+    )
+
     def fmt(m):
+        team1_ids, team2_ids = _match_team_ids(m)
+        my_team = "team1" if user_id in team1_ids else "team2"
+        opponent_ids = team2_ids if my_team == "team1" else team1_ids
+        teammates = [pid for pid in (team1_ids if my_team == "team1" else team2_ids) if pid != user_id]
+        serialized_sets = _serialize_match_sets(sets_by_match.get(str(m.id), []))
+
         return {
             "id": str(m.id), "sport": m.sport.value,
             "match_type": m.match_type.value, "match_format": m.match_format.value,
@@ -1779,10 +1901,18 @@ def get_my_matches(
             "player3_id": str(m.player3_id) if m.player3_id is not None else None,
             "player4_id": str(m.player4_id) if m.player4_id is not None else None,
             "winner_id":  str(m.winner_id)  if m.winner_id  is not None else None,
+            "my_team": my_team,
+            "team1": [{"id": pid, "name": name_map.get(pid, pid[:8])} for pid in team1_ids],
+            "team2": [{"id": pid, "name": name_map.get(pid, pid[:8])} for pid in team2_ids],
+            "opponents": [{"id": pid, "name": name_map.get(pid, pid[:8])} for pid in opponent_ids],
+            "teammates": [{"id": pid, "name": name_map.get(pid, pid[:8])} for pid in teammates],
+            "sets": serialized_sets,
+            "score": _final_score_label(serialized_sets),
             "scheduled_at": str(m.scheduled_at) if m.scheduled_at is not None else None,
             "started_at":   str(m.started_at)   if m.started_at   is not None else None,
             "completed_at": str(m.completed_at) if m.completed_at is not None else None,
             "created_at":   str(m.created_at),
+            "my_rating_change": (getattr(m, "rating_changes", None) or {}).get(user_id),
         }
 
     return {"matches": [fmt(m) for m in matches]}
@@ -1844,7 +1974,13 @@ async def match_ws(websocket: WebSocket, match_id: str):
     async def ws_keepalive():
         try:
             while True:
-                await websocket.receive_text()
+                data = await websocket.receive_text()
+                try:
+                    msg = json.loads(data)
+                    if msg.get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+                except Exception:
+                    pass
         except (WebSocketDisconnect, Exception):
             pass
 
@@ -2292,6 +2428,11 @@ def complete_match(
                 score=0.0 if p1_wins else 1.0,
             ),
         )
+        # Narrow str | None → str: all four IDs are guaranteed non-None inside this
+        # block (p1–p4 are live rating rows, and team IDs came from match.player3/4_id
+        # which we checked non-None before fetching p3/p4).
+        assert player1_id is not None and player2_id is not None
+        assert team1_partner_id is not None and team2_partner_id is not None
         adjusted_ratings = redistribute_match_ratings_by_performance(
             match,
             match_history_rows,
@@ -2336,6 +2477,10 @@ def complete_match(
             opp_rating=float(p1.rating), opp_rd=float(p1.rating_deviation),  # type: ignore[arg-type]
             score=0.0 if p1_wins else 1.0,
         )
+    # Snapshot old ratings before fn_complete_match expires them
+    _old_r_p1 = float(p1.rating)  # type: ignore[arg-type]
+    _old_r_p2 = float(p2.rating)  # type: ignore[arg-type]
+
     # Atomic DB operations via stored procedure:
     # marks match completed, releases court, updates both ratings,
     # grants referee boost, advances tournament bracket — all in one transaction
@@ -2355,6 +2500,17 @@ def complete_match(
         db.expire(p1)
         db.expire(p2)
         _refresh_rating_eligibility(db, [player1_id, player2_id], sport, match_format)
+
+        # Store per-player rating deltas for match history display
+        _rc: dict = {
+            player1_id: round(new_p1_r - _old_r_p1, 1),
+            player2_id: round(new_p2_r - _old_r_p2, 1),
+        }
+        if is_doubles and partner_updates is not None and team1_partner_id and team2_partner_id:
+            _, (p3_new_r, _, _), _, (p4_new_r, _, _) = partner_updates
+            _rc[team1_partner_id] = round(p3_new_r - float(p3.rating), 1)  # type: ignore[arg-type]
+            _rc[team2_partner_id] = round(p4_new_r - float(p4.rating), 1)  # type: ignore[arg-type]
+        setattr(match, "rating_changes", _rc)
     except Exception as exc:
         db.rollback()
         logger.error(
@@ -2388,7 +2544,7 @@ def complete_match(
         _p3, (p3_r, p3_rd, p3_vol), _p4, (p4_r, p4_rd, p4_vol) = partner_updates
         _apply_rating_result(_p3, won=p1_wins,      new_rating=p3_r, new_rd=p3_rd, new_vol=p3_vol)
         _apply_rating_result(_p4, won=not p1_wins,  new_rating=p4_r, new_rd=p4_rd, new_vol=p4_vol)
-        _refresh_rating_eligibility(db, [team1_partner_id, team2_partner_id], sport, match_format)
+        _refresh_rating_eligibility(db, [p for p in [team1_partner_id, team2_partner_id] if p is not None], sport, match_format)
         db.commit()
 
     # Ensure party state can't keep redirecting users back into an already-finished match.
@@ -2423,7 +2579,7 @@ def complete_match(
     try:
         refresh_performance_metrics(
             db,
-            [player1_id, player2_id, team1_partner_id, team2_partner_id],
+            [p for p in [player1_id, player2_id, team1_partner_id, team2_partner_id] if p is not None],
             sport=sport,
             match_format=match_format,
         )
@@ -2438,6 +2594,16 @@ def complete_match(
         pass
 
     _broadcast(match_id, {"type": "match_completed", "winner_id": winner_anchor_id})
+
+    try:
+        from app.services.auto_insight import schedule_auto_insight
+        schedule_auto_insight(
+            player1_id, player2_id,
+            team1_partner_id or "", team2_partner_id or "",
+        )
+    except Exception:
+        pass
+
     return {"message": "Match completed.", "winner_id": winner_anchor_id}
 
 
@@ -3275,6 +3441,12 @@ def get_match_history(
     match = db.query(Match).filter(Match.id == match_id).first()
     if not match:
         raise HTTPException(404, "Match not found.")
+    user_id = str(current_user["id"])
+    allowed_ids = set(_match_player_ids(match))
+    if match.referee_id is not None:
+        allowed_ids.add(str(match.referee_id))
+    if user_id not in allowed_ids:
+        raise HTTPException(403, "You do not have access to this match history.")
     if (match.status.value if hasattr(match.status, "value") else str(match.status)) == "invalidated":
         return {"history": []}
 
@@ -3282,13 +3454,25 @@ def get_match_history(
         MatchHistory.match_id == match_id,
     ).order_by(MatchHistory.created_at.desc()).limit(limit).all()
 
+    name_map = _profile_name_map(
+        db,
+        [
+            str(player_id)
+            for e in entries
+            for player_id in [e.player_id, e.recorded_by]
+            if player_id is not None
+        ],
+    )
+
     return {"history": [
         {
             "id":          str(e.id),
             "event_type":  e.event_type,
             "team":        e.team,
             "player_id":   str(e.player_id)   if e.player_id   is not None else None,
+            "player_name": name_map.get(str(e.player_id)) if e.player_id is not None else None,
             "recorded_by": str(e.recorded_by) if e.recorded_by is not None else None,
+            "recorded_by_name": name_map.get(str(e.recorded_by)) if e.recorded_by is not None else None,
             "description": e.description,
             "set_number":  e.set_number,
             "team1_score": e.team1_score,

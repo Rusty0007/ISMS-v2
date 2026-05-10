@@ -6,8 +6,12 @@ from typing import Optional
 import uuid
 
 from app.database import get_db
-from app.models.models import FeedPost, PostComment, PostReaction, Profile, Club
+from app.models.models import (
+    FeedPost, FeedNotification, PostComment, PostReaction,
+    Profile, Club, ClubMember, TournamentRegistration, Match,
+)
 from app.middleware.auth import get_current_user
+from app.services.notifications import publish_feed_unread
 
 router = APIRouter()
 
@@ -180,6 +184,67 @@ def get_feed(
     }
 
 
+def _target_users_for_post(post: FeedPost, author_id: str, db: Session) -> list[str]:
+    """Return user IDs who should receive a feed notification for this post."""
+    targets: set[str] = set()
+
+    if post.club_id:
+        rows = db.query(ClubMember.user_id).filter(ClubMember.club_id == post.club_id).all()
+        targets.update(str(r.user_id) for r in rows)
+
+    if post.tournament_id:
+        rows = db.query(TournamentRegistration.player_id, TournamentRegistration.partner_id).filter(
+            TournamentRegistration.tournament_id == post.tournament_id,
+            TournamentRegistration.status == "confirmed",
+        ).all()
+        for r in rows:
+            targets.add(str(r.player_id))
+            if r.partner_id:
+                targets.add(str(r.partner_id))
+
+    if post.match_id:
+        m = db.query(Match).filter(Match.id == post.match_id).first()
+        if m:
+            for fld in ("player1_id", "player2_id", "team1_player1", "team1_player2", "team2_player1", "team2_player2"):
+                val = getattr(m, fld, None)
+                if val:
+                    targets.add(str(val))
+
+    # For context-free manual posts, notify all club-mates of the author
+    if not post.club_id and not post.tournament_id and not post.match_id:
+        club_ids = [str(r.club_id) for r in db.query(ClubMember.club_id).filter(ClubMember.user_id == author_id).all()]
+        if club_ids:
+            rows = db.query(ClubMember.user_id).filter(ClubMember.club_id.in_(club_ids)).all()
+            targets.update(str(r.user_id) for r in rows)
+
+    targets.discard(author_id)
+    return list(targets)
+
+
+def _dispatch_feed_notifications(post: FeedPost, author_id: str, db: Session) -> None:
+    target_ids = _target_users_for_post(post, author_id, db)
+    if not target_ids:
+        return
+
+    post_uuid = post.id
+    for uid in target_ids:
+        notif = FeedNotification(
+            id      = uuid.uuid4(),
+            user_id = uuid.UUID(uid),
+            post_id = post_uuid,
+            is_read = False,
+        )
+        db.merge(notif)  # ON CONFLICT DO NOTHING equivalent via merge on pk
+    db.flush()
+
+    for uid in target_ids:
+        count = db.query(FeedNotification).filter(
+            FeedNotification.user_id == uuid.UUID(uid),
+            FeedNotification.is_read == False,  # noqa: E712
+        ).count()
+        publish_feed_unread(uid, count)
+
+
 @router.post("")
 def create_post(
     body:         CreatePostRequest,
@@ -208,6 +273,15 @@ def create_post(
     db.add(post)
     db.commit()
     db.refresh(post)
+
+    # Dispatch feed notifications via Celery; fall back to inline if unavailable.
+    try:
+        from app.tasks.feed import dispatch_feed_notifications
+        dispatch_feed_notifications.delay(str(post.id))
+    except Exception:
+        _dispatch_feed_notifications(post, me_id, db)
+        db.commit()
+
     return {"post": _serialize_post(post, me_id, db)}
 
 
@@ -406,3 +480,30 @@ def add_comment(
             "author":     _author_dict(author) if author else {"id": str(me_id), "username": "", "first_name": None, "last_name": None, "avatar_url": None},
         }
     }
+
+
+@router.get("/unread-count")
+def get_feed_unread_count(
+    current_user: dict    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    me_id = uuid.UUID(current_user["id"])
+    count = db.query(FeedNotification).filter(
+        FeedNotification.user_id == me_id,
+        FeedNotification.is_read == False,  # noqa: E712
+    ).count()
+    return {"count": count}
+
+
+@router.post("/mark-read")
+def mark_feed_read(
+    current_user: dict    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    me_id = uuid.UUID(current_user["id"])
+    db.query(FeedNotification).filter(
+        FeedNotification.user_id == me_id,
+        FeedNotification.is_read == False,  # noqa: E712
+    ).update({"is_read": True})
+    db.commit()
+    return {"count": 0}
