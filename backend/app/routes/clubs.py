@@ -16,7 +16,7 @@ from app.database import get_db
 from app.models.models import Club, ClubMember, ClubInvite, ClubCheckin, Court, CourtBooking, FeedPost, Profile, Match, PlayerRating
 from sqlalchemy import func, or_
 from app.middleware.auth import get_current_user
-from app.services.notifications import send_notification
+from app.services.notifications import send_notification, broadcast_global_announcement
 
 router = APIRouter()
 
@@ -109,8 +109,34 @@ def create_club(
 
     # Auto-enroll creator as owner
     db.add(ClubMember(club_id=club.id, user_id=user_id, role="owner"))
+
+    # Global feed announcement
+    creator = db.query(Profile).filter(Profile.id == user_id).first()
+    creator_name = f"{getattr(creator, 'first_name', '') or ''} {getattr(creator, 'last_name', '') or ''}".strip() or "Someone"
+    sport_label = (club.sport or "").title()
+    post = FeedPost(
+        author_id  = user_id,
+        post_type  = "announcement",
+        content    = f"New {sport_label} club just opened: **{club.name}**! {club.description or ''}".strip(),
+        club_id    = club.id,
+        is_pinned  = False,
+        is_global  = True,
+        meta       = {"announcement_type": "new_club", "club_id": str(club.id), "sport": club.sport or ""},
+    )
+    db.add(post)
     db.commit()
     db.refresh(club)
+    db.refresh(post)
+
+    broadcast_global_announcement(
+        announcement_type = "new_club",
+        id                = str(club.id),
+        name              = club.name,
+        sport             = club.sport or "",
+        description       = club.description,
+        post_id           = str(post.id),
+        creator_name      = creator_name,
+    )
 
     return {"club_id": str(club.id), "message": "Club created."}
 

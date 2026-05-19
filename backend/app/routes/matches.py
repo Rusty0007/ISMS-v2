@@ -252,10 +252,11 @@ def _refresh_rating_eligibility(db: Session, user_ids: list[str], sport: str, ma
             continue
 
         matches_played = _model_int(rating, "matches_played")
+        ranked_matches_played = _model_int(rating, "ranked_matches_played")
         distinct_opponents = _count_distinct_opponents(db, user_id, sport, match_format)
         rd = float(rating.rating_deviation or 999.0)  # type: ignore[arg-type]
         matchmaking_ready = matchmaking_eligible(matches_played)
-        leaderboard_ready = leaderboard_eligible(matches_played, distinct_opponents, rd)
+        leaderboard_ready = leaderboard_eligible(ranked_matches_played, distinct_opponents, rd)
 
         setattr(rating, "distinct_opponents_count", distinct_opponents)
         setattr(rating, "is_matchmaking_eligible", matchmaking_ready)

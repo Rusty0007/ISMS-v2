@@ -9,6 +9,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.services.rating_policy import (
+    ML_MATCHMAKING_MIN_MATCHES,
     enum_value,
     leaderboard_eligible,
     match_side_ids,
@@ -52,6 +53,7 @@ class RatingSnapshot:
     current_loss_streak: int = 0
     rating_status: str = "CALIBRATING"
     calibration_matches_played: int = 0
+    ranked_matches_played: int = 0
     distinct_opponents: set[str] | None = None
     is_matchmaking_eligible: bool = False
     is_leaderboard_eligible: bool = False
@@ -106,10 +108,16 @@ def _apply_snapshot_result(
     rating_deviation: float,
     volatility: float,
     completed_at: datetime | None,
+    is_ranked: bool = False,
 ) -> None:
-    snapshot.rating = rating
-    snapshot.rating_deviation = rating_deviation
-    snapshot.volatility = volatility
+    # Glicko-2 only updates when ranked/tournament OR player is still calibrating.
+    # Check matches_played BEFORE incrementing — same logic as fn_complete_match CASE expression.
+    is_calibrating = snapshot.matches_played < ML_MATCHMAKING_MIN_MATCHES
+    if is_ranked or is_calibrating:
+        snapshot.rating = rating
+        snapshot.rating_deviation = rating_deviation
+        snapshot.volatility = volatility
+
     snapshot.matches_played += 1
 
     if won:
@@ -122,11 +130,14 @@ def _apply_snapshot_result(
         snapshot.current_loss_streak += 1
 
     snapshot.calibration_matches_played += 1
+    if is_ranked:
+        snapshot.ranked_matches_played += 1
     snapshot.is_matchmaking_eligible = matchmaking_eligible(snapshot.matches_played)
     if (
         snapshot.rating_status == "CALIBRATING"
+        and is_ranked
         and leaderboard_eligible(
-            snapshot.matches_played,
+            snapshot.ranked_matches_played,
             len(snapshot.distinct_opponents or set()),
             snapshot.rating_deviation,
         )
@@ -159,6 +170,8 @@ def replay_match_into_snapshots(
 
     sport = enum_value(match.sport)
     match_format = enum_value(match.match_format)
+    match_type = enum_value(match.match_type) if hasattr(match, "match_type") else "queue"
+    is_ranked = match_type in ("ranked", "tournament")
     team1 = [_snapshot(snapshots, user_id, sport, match_format) for user_id in team1_ids]
     team2 = [_snapshot(snapshots, user_id, sport, match_format) for user_id in team2_ids]
     team1_rating, team1_rd = _team_average(team1)
@@ -234,6 +247,7 @@ def replay_match_into_snapshots(
             rating_deviation=rating_deviation,
             volatility=volatility,
             completed_at=match.completed_at,
+            is_ranked=is_ranked,
         )
 
     return True
@@ -293,6 +307,7 @@ def _apply_snapshot_to_row(row: "PlayerRating", snapshot: RatingSnapshot) -> Non
     row.current_loss_streak = snapshot.current_loss_streak
     row.rating_status = snapshot.rating_status
     row.calibration_matches_played = snapshot.calibration_matches_played
+    row.ranked_matches_played = snapshot.ranked_matches_played
     row.distinct_opponents_count = len(snapshot.distinct_opponents or set())
     row.is_matchmaking_eligible = snapshot.is_matchmaking_eligible
     row.is_leaderboard_eligible = snapshot.is_leaderboard_eligible

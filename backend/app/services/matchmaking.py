@@ -830,13 +830,26 @@ def run_matchmaking(
             return None
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── GUARD 2: gender composition (mixed doubles) ───────────────────────────
+    # ── GUARD 2: calibration tier separation ─────────────────────────────────
+    # All 4 players must be in the same tier — calibrating (< 10 matches) or
+    # rated (10+). Mirrors the hard guard in singles find_best_opponent Guard 5.
+    _CAL_THRESHOLD = 10
+    _cal_flags = [int(p.get("matches_played", 0)) < _CAL_THRESHOLD for p in four_players]
+    if any(_cal_flags) and not all(_cal_flags):
+        logger.info(
+            f"[2v2/{mode}] REJECTED [calibration_tier] mixed calibrating/rated pool "
+            f"matches_played={[p.get('matches_played', 0) for p in four_players]}"
+        )
+        return None
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── GUARD 3: gender composition (mixed doubles) ───────────────────────────
     if match_format == "mixed_doubles" and not is_mixed_doubles_pool_viable(four_players):
         logger.info("[2v2/mixed_doubles] Pool is not gender-viable for mixed doubles.")
         return None
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── GUARD 3: geo pool compatibility ──────────────────────────────────────
+    # ── GUARD 5: geo pool compatibility ──────────────────────────────────────
     if not _all_unrated_normal(four_players, mode):
         geo_ok, weakest_geo, required_geo = is_geo_pool_compatible(four_players, mode, wait_seconds)
         if not geo_ok:
@@ -988,7 +1001,21 @@ def can_join_doubles_lobby(
         return False
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── GUARD 2: geo pool compatibility ──────────────────────────────────────
+    # ── GUARD 2: calibration tier separation ─────────────────────────────────
+    # Incoming player must share the same calibration tier as the lobby.
+    _CAL_THRESHOLD = 10
+    incoming_calibrating = int(incoming.get("matches_played", 0)) < _CAL_THRESHOLD
+    lobby_calibrating    = [int(p.get("matches_played", 0)) < _CAL_THRESHOLD for p in lobby_players]
+    if any(lobby_calibrating) != incoming_calibrating:
+        logger.debug(
+            f"[doubles_entry/{mode}] REJECTED [calibration_tier] "
+            f"incoming_calibrating={incoming_calibrating} "
+            f"lobby_calibrating={lobby_calibrating}"
+        )
+        return False
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── GUARD 3: geo pool compatibility ──────────────────────────────────────
     all_players = [*lobby_players, incoming]
     if not _all_unrated_normal(all_players, mode):
         geo_ok, weakest_geo, required_geo = is_geo_pool_compatible(
@@ -1003,7 +1030,7 @@ def can_join_doubles_lobby(
             return False
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── GUARD 3+4+5: skill gate via score_doubles_entry + mode threshold ──────
+    # ── GUARD 4+5+6: skill gate via score_doubles_entry + mode threshold ──────
     score = score_doubles_entry(
         incoming, lobby_players, sport, match_format, lobby_wait_seconds, mode
     )

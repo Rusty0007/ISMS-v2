@@ -23,9 +23,9 @@ from app.models.models import (
     Tournament, TournamentRegistration, Match, MatchSet, Profile, PlayerRating,
     TournamentGroup, TournamentGroupMember, TournamentGroupStanding,
     Court, Club, MatchHistory, UserRoleModel, ClubMember, ClubCheckin,
-    TournamentRefereeRegistration, MatchLobbyPlayer,
+    TournamentRefereeRegistration, MatchLobbyPlayer, FeedPost,
 )
-from app.services.notifications import send_notification, send_bulk_notifications
+from app.services.notifications import send_notification, send_bulk_notifications, broadcast_global_announcement
 from app.services.broadcast import broadcast_match
 from app.services.tournament_runtime import (
     dispatch_due_tournament_match_reminders,
@@ -944,6 +944,34 @@ def create_tournament(
     db.add(t)
     db.commit()
     db.refresh(t)
+
+    # Global feed announcement
+    organizer = db.query(Profile).filter(Profile.id == t.organizer_id).first()
+    organizer_name = f"{getattr(organizer, 'first_name', '') or ''} {getattr(organizer, 'last_name', '') or ''}".strip() or "Someone"
+    sport_label = (t.sport.value if hasattr(t.sport, "value") else str(t.sport or "")).title()
+    post = FeedPost(
+        author_id     = t.organizer_id,
+        post_type     = "announcement",
+        content       = f"New {sport_label} tournament open for registration: **{t.name}**! {t.description or ''}".strip(),
+        tournament_id = t.id,
+        is_pinned     = False,
+        is_global     = True,
+        meta          = {"announcement_type": "new_tournament", "tournament_id": str(t.id), "sport": sport_label.lower()},
+    )
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+
+    broadcast_global_announcement(
+        announcement_type = "new_tournament",
+        id                = str(t.id),
+        name              = t.name,
+        sport             = sport_label.lower(),
+        description       = t.description,
+        post_id           = str(post.id),
+        creator_name      = organizer_name,
+    )
+
     return {"tournament": _tournament_summary(t)}
 
 

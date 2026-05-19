@@ -740,6 +740,7 @@ class FeedPost(Base):
     # Structured payload for special post types
     meta          = Column(JSONB)
     is_pinned     = Column(Boolean, default=False)
+    is_global     = Column(Boolean, default=False)
     created_at    = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
     comments      = relationship("PostComment",  back_populates="post", cascade="all, delete")

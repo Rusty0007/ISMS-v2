@@ -202,6 +202,8 @@ def list_users(
     barangay_code: str | None = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    sort_by: str = Query("joined", description="Sort field: joined|rating|matches"),
+    sort_dir: str = Query("desc", description="Sort direction: asc|desc"),
     _: dict = _admin,
     db: Session = Depends(get_db),
 ):
@@ -221,9 +223,26 @@ def list_users(
         query = query.filter(Profile.barangay_code == barangay_code)
 
     total = query.count()
+
+    if sort_by in ("rating", "matches"):
+        agg_sub = (
+            db.query(
+                PlayerRating.user_id.label("uid"),
+                func.sum(PlayerRating.matches_played).label("total_matches"),
+                func.max(PlayerRating.rating).label("best_rating"),
+            )
+            .group_by(PlayerRating.user_id)
+            .subquery("rating_agg")
+        )
+        query = query.outerjoin(agg_sub, Profile.id == agg_sub.c.uid)
+        col = agg_sub.c.best_rating if sort_by == "rating" else agg_sub.c.total_matches
+        order_col = col.desc().nullslast() if sort_dir == "desc" else col.asc().nullslast()
+        query = query.order_by(order_col)
+    else:
+        query = query.order_by(Profile.created_at.desc())
+
     users = (
         query
-        .order_by(Profile.created_at.desc())
         .offset((page - 1) * limit)
         .limit(limit)
         .all()

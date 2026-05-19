@@ -87,12 +87,13 @@ def matchmaking_eligible(matches_played: int) -> bool:
 
 
 def leaderboard_eligible(
-    matches_played: int,
+    ranked_matches_played: int,
     distinct_opponents: int,
     rating_deviation: float,
+    matches_played: int = 0,  # kept for backwards compat, no longer used for eligibility
 ) -> bool:
     return (
-        int(matches_played or 0) >= LEADERBOARD_MIN_MATCHES
+        int(ranked_matches_played or 0) >= LEADERBOARD_MIN_MATCHES
         and int(distinct_opponents or 0) >= LEADERBOARD_MIN_DISTINCT_OPPONENTS
         and float(rating_deviation or 999.0) <= LEADERBOARD_RD_THRESHOLD
     )

@@ -59,6 +59,8 @@ def _run_column_migrations():
         conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS fcm_token TEXT"))
         conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE profiles ALTER COLUMN username DROP NOT NULL"))
+        # feed_posts — global broadcast announcements
+        conn.execute(text("ALTER TABLE feed_posts ADD COLUMN IF NOT EXISTS is_global BOOLEAN DEFAULT FALSE"))
         # matches — queue location snapshot
         conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS queue_city_code TEXT"))
         conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS queue_province_code TEXT"))
@@ -85,23 +87,70 @@ def _run_column_migrations():
         conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_clutch_points_won NUMERIC DEFAULT 0"))
         conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_clutch_errors NUMERIC DEFAULT 0"))
         conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS performance_last_calculated_at TIMESTAMPTZ"))
+        # ranked_matches_played — only increments for ranked/tournament matches; gates leaderboard eligibility
+        conn.execute(text("ALTER TABLE player_ratings ADD COLUMN IF NOT EXISTS ranked_matches_played INTEGER DEFAULT 0"))
+        # Back-fill ranked_matches_played from match history for existing rows
+        conn.execute(text("""
+            UPDATE player_ratings pr
+            SET ranked_matches_played = sub.cnt
+            FROM (
+                SELECT
+                    CASE WHEN m.match_format::TEXT IN ('doubles', 'mixed_doubles')
+                         THEN COALESCE(m.team1_player1, m.player1_id)
+                         ELSE m.player1_id
+                    END AS uid,
+                    m.sport::TEXT AS sport,
+                    m.match_format::TEXT AS fmt,
+                    COUNT(*) AS cnt
+                FROM matches m
+                WHERE m.status = 'completed'
+                  AND m.match_type::TEXT IN ('ranked', 'tournament')
+                GROUP BY 1, 2, 3
+            ) sub
+            WHERE pr.user_id = sub.uid
+              AND pr.sport::TEXT = sub.sport
+              AND pr.match_format::TEXT = sub.fmt
+              AND pr.ranked_matches_played = 0
+        """))
+        conn.execute(text("""
+            UPDATE player_ratings pr
+            SET ranked_matches_played = sub.cnt
+            FROM (
+                SELECT
+                    CASE WHEN m.match_format::TEXT IN ('doubles', 'mixed_doubles')
+                         THEN COALESCE(m.team2_player1, m.player3_id, m.player2_id)
+                         ELSE m.player2_id
+                    END AS uid,
+                    m.sport::TEXT AS sport,
+                    m.match_format::TEXT AS fmt,
+                    COUNT(*) AS cnt
+                FROM matches m
+                WHERE m.status = 'completed'
+                  AND m.match_type::TEXT IN ('ranked', 'tournament')
+                GROUP BY 1, 2, 3
+            ) sub
+            WHERE pr.user_id = sub.uid
+              AND pr.sport::TEXT = sub.sport
+              AND pr.match_format::TEXT = sub.fmt
+              AND pr.ranked_matches_played = 0
+        """))
         # Back-fill coarse eligibility; the history rebuild below recomputes opponent diversity exactly.
         conn.execute(text("""
             UPDATE player_ratings
             SET calibration_matches_played = GREATEST(COALESCE(calibration_matches_played, 0), LEAST(COALESCE(matches_played, 0), :leaderboard_min_matches)),
                 is_matchmaking_eligible    = COALESCE(matches_played, 0) >= :ml_min_matches,
-                is_leaderboard_eligible    = COALESCE(matches_played, 0) >= :leaderboard_min_matches
+                is_leaderboard_eligible    = COALESCE(ranked_matches_played, 0) >= :leaderboard_min_matches
                                            AND COALESCE(distinct_opponents_count, 0) >= :leaderboard_min_opponents
                                            AND COALESCE(rating_deviation, 999) <= :leaderboard_rd_threshold,
                 rating_status              = CASE
-                    WHEN COALESCE(matches_played, 0) >= :leaderboard_min_matches
+                    WHEN COALESCE(ranked_matches_played, 0) >= :leaderboard_min_matches
                      AND COALESCE(distinct_opponents_count, 0) >= :leaderboard_min_opponents
                      AND COALESCE(rating_deviation, 999) <= :leaderboard_rd_threshold
                     THEN 'RATED'
                     ELSE COALESCE(rating_status, 'CALIBRATING')
                 END,
                 calibration_completed_at   = CASE
-                    WHEN COALESCE(matches_played, 0) >= :leaderboard_min_matches
+                    WHEN COALESCE(ranked_matches_played, 0) >= :leaderboard_min_matches
                      AND COALESCE(distinct_opponents_count, 0) >= :leaderboard_min_opponents
                      AND COALESCE(rating_deviation, 999) <= :leaderboard_rd_threshold
                     THEN COALESCE(calibration_completed_at, updated_at, NOW())
@@ -593,6 +642,7 @@ def _run_stored_procedures():
                 v_player3_id       UUID;
                 v_sport            TEXT;
                 v_format           TEXT;
+                v_match_type       TEXT;
                 v_court_id         UUID;
                 v_referee_id       UUID;
                 v_next_match_id    UUID;
@@ -600,16 +650,19 @@ def _run_stored_procedures():
                 v_p1_wins          BOOLEAN;
                 v_loser_id         UUID;
                 v_loser_next_id    UUID;
+                v_is_ranked        BOOLEAN;
             BEGIN
                 SELECT player1_id, player2_id, team1_player1, team2_player1, player3_id,
-                       sport::TEXT, match_format::TEXT,
+                       sport::TEXT, match_format::TEXT, match_type::TEXT,
                        court_id, referee_id, next_match_id, bracket_position,
                        loser_next_match_id
                 INTO   v_player1_id, v_player2_id, v_team1_player1, v_team2_player1, v_player3_id,
-                       v_sport, v_format,
+                       v_sport, v_format, v_match_type,
                        v_court_id, v_referee_id, v_next_match_id, v_bracket_pos,
                        v_loser_next_id
                 FROM matches WHERE id = p_match_id;
+
+                v_is_ranked := v_match_type IN ('ranked', 'tournament');
 
                 -- 1. Mark match completed
                 UPDATE matches
@@ -631,10 +684,12 @@ def _run_stored_procedures():
                 v_p1_wins := (v_player1_id = p_winner_id);
 
                 -- 3. Update player 1 rating
+                -- Glicko-2 fields only update when ranked/tournament OR player is still calibrating.
+                -- Wins/losses/streaks always recorded for history accuracy.
                 UPDATE player_ratings SET
-                    rating              = p_r1,
-                    rating_deviation    = p_rd1,
-                    volatility          = p_vol1,
+                    rating              = CASE WHEN v_is_ranked OR matches_played < {ML_MATCHMAKING_MIN_MATCHES} THEN p_r1  ELSE rating           END,
+                    rating_deviation    = CASE WHEN v_is_ranked OR matches_played < {ML_MATCHMAKING_MIN_MATCHES} THEN p_rd1 ELSE rating_deviation  END,
+                    volatility          = CASE WHEN v_is_ranked OR matches_played < {ML_MATCHMAKING_MIN_MATCHES} THEN p_vol1 ELSE volatility        END,
                     matches_played      = matches_played + 1,
                     wins                = wins   + CASE WHEN v_p1_wins THEN 1 ELSE 0 END,
                     losses              = losses + CASE WHEN v_p1_wins THEN 0 ELSE 1 END,
@@ -647,9 +702,9 @@ def _run_stored_procedures():
 
                 -- 4. Update player 2 rating
                 UPDATE player_ratings SET
-                    rating              = p_r2,
-                    rating_deviation    = p_rd2,
-                    volatility          = p_vol2,
+                    rating              = CASE WHEN v_is_ranked OR matches_played < {ML_MATCHMAKING_MIN_MATCHES} THEN p_r2  ELSE rating           END,
+                    rating_deviation    = CASE WHEN v_is_ranked OR matches_played < {ML_MATCHMAKING_MIN_MATCHES} THEN p_rd2 ELSE rating_deviation  END,
+                    volatility          = CASE WHEN v_is_ranked OR matches_played < {ML_MATCHMAKING_MIN_MATCHES} THEN p_vol2 ELSE volatility        END,
                     matches_played      = matches_played + 1,
                     wins                = wins   + CASE WHEN v_p1_wins THEN 0 ELSE 1 END,
                     losses              = losses + CASE WHEN v_p1_wins THEN 1 ELSE 0 END,
@@ -688,14 +743,34 @@ def _run_stored_procedures():
                     END IF;
                 END IF;
 
-                -- 8. Calibration: {ML_MATCHMAKING_MIN_MATCHES} matches unlock ML matchmaking.
-                -- Leaderboard eligibility is refreshed in Python because it depends
-                -- on distinct opponent counts across match history.
+                -- 8. Calibration: {ML_MATCHMAKING_MIN_MATCHES} matches (any mode) unlock ML matchmaking.
+                -- ranked_matches_played only increments for ranked/tournament — gates leaderboard/RATED.
+                -- Leaderboard eligibility is also refreshed in Python for distinct opponent diversity.
                 UPDATE player_ratings SET
                     calibration_matches_played = calibration_matches_played + 1,
                     is_matchmaking_eligible = CASE
                         WHEN calibration_matches_played + 1 >= {ML_MATCHMAKING_MIN_MATCHES} THEN TRUE
                         ELSE is_matchmaking_eligible
+                    END,
+                    ranked_matches_played = CASE
+                        WHEN v_is_ranked THEN ranked_matches_played + 1
+                        ELSE ranked_matches_played
+                    END,
+                    is_leaderboard_eligible = CASE
+                        WHEN v_is_ranked
+                         AND ranked_matches_played + 1 >= {LEADERBOARD_MIN_MATCHES}
+                         AND distinct_opponents_count >= {LEADERBOARD_MIN_DISTINCT_OPPONENTS}
+                         AND rating_deviation <= {LEADERBOARD_RD_THRESHOLD}
+                        THEN TRUE
+                        ELSE is_leaderboard_eligible
+                    END,
+                    rating_status = CASE
+                        WHEN v_is_ranked
+                         AND ranked_matches_played + 1 >= {LEADERBOARD_MIN_MATCHES}
+                         AND distinct_opponents_count >= {LEADERBOARD_MIN_DISTINCT_OPPONENTS}
+                         AND rating_deviation <= {LEADERBOARD_RD_THRESHOLD}
+                        THEN 'RATED'
+                        ELSE rating_status
                     END
                 WHERE user_id IN (v_player1_id, v_player2_id)
                   AND sport::TEXT   = v_sport
@@ -777,6 +852,7 @@ def _run_view_setup():
                 pr.is_matchmaking_eligible,
                 pr.is_leaderboard_eligible,
                 pr.rating_status,
+                pr.ranked_matches_played,
                 CASE WHEN pr.matches_played > 0
                      THEN ROUND((pr.wins::NUMERIC / pr.matches_played) * 100, 1)
                      ELSE 0
@@ -815,6 +891,7 @@ def _run_view_setup():
                 pr.distinct_opponents_count,
                 pr.is_matchmaking_eligible,
                 pr.is_leaderboard_eligible,
+                pr.ranked_matches_played,
                 CASE WHEN pr.matches_played > 0
                      THEN ROUND((pr.wins::NUMERIC / pr.matches_played) * 100, 1)
                      ELSE 0

@@ -403,11 +403,12 @@ async def notification_event_stream(token: str, db: Session = Depends(get_db)):
         return StreamingResponse(_empty(), media_type="text/event-stream")
 
     redis_client = _aredis
-    _NOTIF_PREFIX = "isms:notif:"
+    _NOTIF_PREFIX  = "isms:notif:"
+    _GLOBAL_CHAN   = "isms:feed:global"
 
     async def _event_generator():
         pubsub = redis_client.pubsub()
-        await pubsub.subscribe(f"{_NOTIF_PREFIX}{user_id}")
+        await pubsub.subscribe(f"{_NOTIF_PREFIX}{user_id}", _GLOBAL_CHAN)
         ping_ticks = 0
         try:
             while True:
@@ -425,6 +426,8 @@ async def notification_event_stream(token: str, db: Session = Depends(get_db)):
                                 yield f'data: {{"event":"feed_unread_count","count":{int(parsed["count"])}}}\n\n'
                             elif t == "notification":
                                 yield 'data: {"event":"new_notification"}\n\n'
+                            elif t == "global_announcement":
+                                yield f"data: {_json.dumps({'event': 'global_announcement', **parsed})}\n\n"
                         except Exception:
                             pass
                 ping_ticks += 1
@@ -434,7 +437,7 @@ async def notification_event_stream(token: str, db: Session = Depends(get_db)):
             pass
         finally:
             try:
-                await pubsub.unsubscribe(f"{_NOTIF_PREFIX}{user_id}")
+                await pubsub.unsubscribe(f"{_NOTIF_PREFIX}{user_id}", _GLOBAL_CHAN)
                 await pubsub.aclose()
             except Exception:
                 pass

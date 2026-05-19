@@ -44,6 +44,40 @@ def publish_feed_unread(user_id: str, count: int) -> None:
     except Exception as e:
         logger.warning(f"[notifications] feed_unread_count publish failed for {user_id}: {e}")
 
+
+_GLOBAL_CHANNEL = "isms:feed:global"
+
+
+def broadcast_global_announcement(
+    announcement_type: str,
+    id: str,
+    name: str,
+    sport: str,
+    description: str | None,
+    post_id: str,
+    creator_name: str,
+) -> None:
+    """Broadcast a new-club or new-tournament announcement to every connected SSE client."""
+    if _redis_notif is None:
+        return
+    try:
+        _redis_notif.publish(
+            _GLOBAL_CHANNEL,
+            json.dumps({
+                "type":              "global_announcement",
+                "announcement_type": announcement_type,
+                "id":                id,
+                "name":              name,
+                "sport":             sport,
+                "description":       description or "",
+                "post_id":           post_id,
+                "creator_name":      creator_name,
+            }),
+        )
+    except Exception as e:
+        logger.warning(f"[notifications] global_announcement broadcast failed: {e}")
+
+
 # ── Firebase Admin SDK (optional — only initialised if credentials file exists) ─
 _fcm_ready = False
 try:
